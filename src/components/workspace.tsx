@@ -218,7 +218,13 @@ export function Workspace() {
                   }}>
                   <Icon size={16} />{label}{id === "findings" && verified && <span>{active.issues.length}</span>}</button>)}</nav>
                 {verified && <details className="export-menu"><summary className="button secondary"><ArrowDownToLine size={16} /> Export</summary>
-                  <div><a href={`/api/batches/${active.id}/export/pdf`}>Download PDF</a><a href={`/api/batches/${active.id}/export/csv`}>Download CSV</a></div></details>}
+                  <div>
+                    <a href={`/api/batches/${active.id}/export/pdf`}>Download PDF</a>
+                    <a href={`/api/batches/${active.id}/export/csv`}>Download CSV</a>
+                    {active.documents.filter((doc) => doc.kind === "xlsx" && !doc.superseded_by).map((doc) =>
+                      <a key={doc.id} href={`/api/documents/${doc.id}/export/xlsx`}>Annotated Excel · {doc.name}</a>)}
+                  </div>
+                </details>}
               </div>
               {view === "documents" && <Documents key={`${active.id}:${docTarget.key}`} batch={active} update={accept} destination={docTarget.destination}
                 onEditorClose={docTarget.destination?.kind === "edit" ? () => setView("findings") : undefined}

@@ -91,8 +91,8 @@ svg { flex-shrink: 0; }
 .export-menu { position: relative; }
 .export-menu summary { list-style: none; }
 .export-menu summary::-webkit-details-marker { display: none; }
-.export-menu > div { position: absolute; z-index: 3; top: calc(100% + 4px); right: 0; width: 135px; padding: 4px; border: 1px solid var(--line); border-radius: 7px; background: #fff; box-shadow: 0 6px 16px #20332214; }
-.export-menu a { display: block; padding: 7px; border-radius: 4px; }
+.export-menu > div { position: absolute; z-index: 3; top: calc(100% + 4px); right: 0; width: max-content; max-width: min(280px, calc(100vw - 36px)); padding: 4px; border: 1px solid var(--line); border-radius: 7px; background: #fff; box-shadow: 0 6px 16px #20332214; }
+.export-menu a { display: block; padding: 7px; border-radius: 4px; overflow-wrap: anywhere; }
 .export-menu a:hover { background: var(--mint); }
 .empty { display: grid; justify-items: center; align-content: center; gap: 9px; min-height: 230px; padding: 24px; text-align: center; }
 .empty.small { min-height: 100px; }

@@ -98,6 +98,87 @@ def test_xlsx_and_scanned_pdf_have_precise_sources(tmp_path):
         assert all(0 <= number <= 1 for box in issue["evidence"][1]["boxes"] for number in box)
 
 
+def test_annotated_workbook_preserves_original_and_marks_current_findings(tmp_path):
+    from io import BytesIO
+    from zipfile import ZipFile
+
+    from openpyxl import load_workbook
+    from openpyxl.chart import BarChart, Reference
+    from openpyxl.formatting.rule import FormulaRule
+    from openpyxl.styles import Font, PatternFill
+
+    workbook = load_workbook(BytesIO(xlsx([BOM])))
+    materials = workbook["Materials"]
+    materials["B2"].font = Font(bold=True, italic=True)
+    materials["B2"].fill = PatternFill("solid", fgColor="FFCCEEDD")
+    materials.conditional_formatting.add("B2:C2", FormulaRule(
+        formula=["1"], fill=PatternFill("solid", fgColor="FFAACCFF")))
+    materials.column_dimensions["B"].width = 41
+    materials.freeze_panes = "B2"
+    materials["G2"] = "=SUM(40,2)"
+    materials["G2"].number_format = "0.00"
+    materials["G3"] = "first[CR]second"
+    notes = workbook.create_sheet("Layout")
+    notes.merge_cells("A1:B1")
+    notes["A1"] = "Calculation details"
+    notes["A2"] = 42
+    chart = BarChart()
+    chart.add_data(Reference(notes, min_col=1, min_row=2))
+    notes.add_chart(chart, "D4")
+    output = BytesIO()
+    workbook.save(output)
+    source = BytesIO()
+    with ZipFile(output) as archive, ZipFile(source, "w") as prepared:
+        for name in archive.namelist():
+            data = archive.read(name)
+            if name == "xl/worksheets/sheet1.xml":
+                data = data.replace(b"first[CR]second", b"first&#13;second")
+            prepared.writestr(name, data)
+    original = source.getvalue()
+
+    with TestClient(create_app(tmp_path / "test.sqlite")) as client:
+        batch = create(client)
+        bom = upload(client, batch, "BOM café.xlsx", original)
+        offer = upload(client, batch, "Offer.pdf", pdf([OFFER], pages=1, terms=TERMS), "Steel supplier")
+        route = f"/documents/{bom}/export/xlsx"
+        assert client.get(f"/documents/{offer}/export/xlsx").status_code == 404
+        assert client.get(route).status_code == 409
+        ok(client.patch(f"/batches/{batch}/scope", json={"mode": "all"}))
+        view = ok(client.post(f"/batches/{batch}/verify"))
+        issue = next(item for item in view["issues"] if item["rule"] == "dimension")
+        response = client.get(route)
+        assert response.is_success, response.text
+        assert response.headers["content-type"] == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        assert "BOM%20caf%C3%A9-annotated.xlsx" in response.headers["content-disposition"]
+        exported = load_workbook(BytesIO(response.content))
+        assert exported.sheetnames == ["Materials", "Layout"]
+        sheet = exported["Materials"]
+        assert sheet["B2"].value == BOM[1]
+        assert sheet["B2"].font.bold and sheet["B2"].font.italic
+        assert sheet["B2"].fill.fgColor.rgb == "FFCCEEDD"
+        assert sheet.column_dimensions["B"].width == 41
+        assert sheet.freeze_panes == "B2"
+        highlight, = sheet.conditional_formatting["B2"]
+        assert highlight.priority == 1 and highlight.dxf.fill.bgColor.rgb == "FFFFE7A7"
+        existing, = sheet.conditional_formatting["B2:C2"]
+        assert existing.priority == 2 and existing.dxf.fill.fgColor.rgb == "FFAACCFF"
+        assert sheet["G2"].value == "=SUM(40,2)"
+        assert sheet["G2"].number_format == "0.00"
+        assert sheet["G3"].value == "first\rsecond"
+        assert "A1:B1" in exported["Layout"].merged_cells
+        with ZipFile(BytesIO(original)) as before, ZipFile(BytesIO(response.content)) as after:
+            assert before.namelist() == after.namelist()
+            assert {name for name in before.namelist() if before.read(name) != after.read(name)} == {
+                "xl/styles.xml", "xl/worksheets/sheet1.xml",
+            }
+        assert client.get(f"/documents/{bom}/original").content == original
+
+        ok(client.patch(f"/batches/{batch}/issues/{issue['id']}", json={"status": "false_positive"}))
+        assert client.get(route).content == original
+        ok(client.patch(f"/batches/{batch}/scope", json={"mode": "unknown"}))
+        assert client.get(route).status_code == 409
+
+
 def test_documented_pack_size_and_missing_pack_detail(tmp_path):
     with TestClient(create_app(tmp_path / "test.sqlite")) as client:
         batch = create(client)

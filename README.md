@@ -45,7 +45,7 @@ Open [the local workspace](http://127.0.0.1:3000). For the production build, kee
 3. Inspect flagged **Material lines**, **Document terms**, and **Original source** entries. To confirm a PDF reading, draw a box and transcribe its source text. For XLSX or DOCX, select the original cell or paragraph. Document the reason when excluding a row or supplying a packaging conversion.
 4. Use **Set scope** on the BOM to select all or specific rows. Coverage defaults to unknown for supplier offers.
 5. Run verification. Review the grouped source cards in **Findings** and save a decision. Use **Focus highlights** to center the relevant regions across the linked documents.
-6. Review the supplier matrix, including reasons for incomparable totals, then download PDF or CSV from **Export**.
+6. Review the supplier matrix, including reasons for incomparable totals, then use **Export** to download a PDF or CSV report or an annotated copy of an uploaded Excel workbook. The Excel copy retains the workbook layout and formulas and highlights cells linked to findings that have not been dismissed as false positives.
 
 Use **Upload revision** on a current quotation when a supplier sends an updated offer. The old file remains in the batch as a superseded source once the revision is accepted. If extraction fails or the service restarts during processing, use **Try reading again**. Check the original when extraction returns few rows or flags OCR. The SQLite database is created at `.suriq/workspace.sqlite` and contains the originals, results, and audit history. Stop the service before copying the database as a backup. Treat backups and downloaded reports as procurement records.
 

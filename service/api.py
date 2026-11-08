@@ -24,6 +24,7 @@ from service.reports import report
 from service.store import Store, apply_overlay, attach_reviews, documents, event, now
 from service.suggestions import suggest
 from service.verification import decimal_value, one_schedule, schedule_baseline, summary_quote, verify
+from service.workbook_export import WorkbookExportError, annotated_workbook
 
 MAX_UPLOAD = int(os.getenv("SURIQ_MAX_UPLOAD_MB", "20")) * 1024 * 1024
 LOG = logging.getLogger("suriq")
@@ -822,6 +823,28 @@ def create_app(path):
         return Response(content, media_type=mime, headers={
             "Content-Disposition": f'attachment; filename="suriq-verification.{extension}"',
         })
+
+    @app.get("/documents/{key}/export/xlsx")
+    def export_workbook(key: str):
+        from urllib.parse import quote
+
+        with store.connection() as db:
+            doc = get_row(db, "documents", key, "batch, kind, name, original")
+            if doc["kind"] != "xlsx":
+                fail(404, "Excel export is available for XLSX sources.")
+            view = load_batch(db, doc["batch"])
+            if not view["verified_at"] or view["stale"]:
+                fail(409, "Verify this batch before exporting.")
+            if any(item["id"] == key and item["superseded_by"] for item in view["documents"]):
+                fail(409, "Export the current workbook for this quotation.")
+        try:
+            content = annotated_workbook(doc["original"], view["issues"], key)
+        except WorkbookExportError as exc:
+            LOG.warning("Workbook export failed for %s", key, exc_info=True)
+            fail(422, str(exc))
+        name = quote(f"{Path(doc['name']).stem}-annotated.xlsx", safe="")
+        return Response(content, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{name}"})
 
     return app
 
