@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "SuriQ AI | Procurement review",
-  description: "Local procurement verification with linked source evidence.",
+  title: "SuriQ | Procurement review",
+  description: "Review supplier quotations against purchase requirements.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

@@ -1,8 +1,8 @@
 "use client";
 
 import {
-  Activity as ActivityIcon, ArrowDownToLine, ArrowRight, ChevronRight, CircleDot, Ellipsis,
-  FileSearch, Files, Folder, FolderPlus, Layers3, Plus, ScanLine, ShieldCheck, Table2, UploadCloud,
+  Activity as ActivityIcon, ArrowDownToLine, ChevronRight, Ellipsis,
+  FileSearch, Files, Folder, Layers3, Plus, ScanLine, Table2, UploadCloud,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Activity, SupplierComparison } from "./comparison";
@@ -10,7 +10,7 @@ import { Documents } from "./documents";
 import { Findings } from "./findings";
 import { api } from "./model";
 import type { Batch, Document, Project } from "./model";
-import { Empty, Modal } from "./shared";
+import { LoadingNotice, Modal, PendingButton, Spinner } from "./shared";
 
 const views = [
   { id: "documents", label: "Documents", Icon: Files },
@@ -35,7 +35,8 @@ export function Workspace() {
   const [dialog, setDialog] = useState<Dialog | null>(null);
   const revision = useRef(0);
   const active = batch?.id === selection ? batch : null;
-  const processing = active?.documents.some((doc) => doc.status === "processing") ?? false;
+  const processingCount = active?.documents.filter((doc) => doc.status === "processing").length ?? 0;
+  const processing = processingCount > 0;
   const project = projects.find((item) => item.id === projectSelection) ?? projects[0];
 
   function accept(value: Batch) {
@@ -116,12 +117,11 @@ export function Workspace() {
   return <div className="app-shell">
     <header className="topbar">
       <div className="brand"><span className="brand-icon"><ScanLine size={24} strokeWidth={1.9} /></span>
-        <span>SuriQ<span className="brand-ai"> AI</span><small>PROCUREMENT VERIFICATION</small></span></div>
-      <div className="local-badge"><span /><ShieldCheck size={15} /> Local workspace</div>
+        <span>SuriQ</span></div>
     </header>
     <div className="shell-body">
       <aside className="project-sidebar" aria-label="Projects and batches">
-        <div className="sidebar-head"><span className="eyebrow">WORKSPACE</span>
+        <div className="sidebar-head"><span className="sidebar-label">Projects</span>
           <button className="icon-button" type="button" aria-label="New project" title="New project"
             onClick={() => setDialog({ kind: "project" })}><Plus size={18} /></button></div>
         {!projects.length && <div className="sidebar-empty">Your procurement projects will appear here.</div>}
@@ -139,41 +139,41 @@ export function Workspace() {
               <Plus size={15} /> New batch</button>
           </div>}
         </div>)}
-        <div className="sidebar-foot"><ShieldCheck size={17} /><span><strong>{active?.ai.provider === "gemini" ? "Gemini AI available by opt-in" : "On-device processing"}</strong><small>Local files and verification</small></span></div>
       </aside>
       <main className="main-content">
         {error && <div className="banner error" role="alert">{error}<button type="button" onClick={() => setError("")}>Dismiss</button></div>}
-        {loading || (selection && !active && !error) ? <div className="panel"><Empty icon={<CircleDot size={24} />} title="Loading workspace" /></div>
+        {loading || (selection && !active && !error) ? <div className="panel"><LoadingNotice className="workspace-loading">{loading ? "Loading workspace…" : "Opening batch…"}</LoadingNotice></div>
           : !active ? <Welcome project={project} start={() => setDialog(project ? { kind: "batch", project } : { kind: "project" })} />
           : <>
             <header className="batch-header">
               <div className="breadcrumbs"><Folder size={14} />{active.project_name}<ChevronRight size={13} /><span>Procurement batch</span></div>
               <div className="batch-heading">
-                <div><h1>{active.name}</h1><p>Verify supplier offers against your purchase requirements.</p></div>
+                <h1>{active.name}</h1>
                 <div className="batch-actions">
                   <button className="icon-button batch-menu" type="button" aria-label="Manage batch"
                     onClick={() => setDialog({ kind: "manageBatch" })}><Ellipsis size={20} /></button>
                   <button className="button secondary" type="button" onClick={() => setDialog({ kind: "upload" })}
                     disabled={working}><UploadCloud size={16} /> Upload</button>
-                  <button className="button primary" type="button" disabled={!canVerify || working} onClick={async () => {
+                  <PendingButton className="button primary" type="button" disabled={!canVerify} pending={working}
+                    pendingLabel="Verifying…" icon={<ScanLine size={17} />} onClick={async () => {
                     setWorking(true); setError("");
                     try { accept(await api<Batch>(`/batches/${active.id}/verify`, "POST")); setView("findings"); }
                     catch (error) { setError((error as Error).message); }
                     finally { setWorking(false); }
-                  }}><ScanLine size={17} /> {working ? "Verifying…" : "Run verification"}</button>
+                  }}>Run verification</PendingButton>
                 </div>
               </div>
-              {active.ai.provider === "gemini" && !active.ai.configured &&
-                <p className="notice" role="status">Add a Gemini API key to enable hosted AI. Native extraction is available.</p>}
-              {active.documents.length > 0 && active.verification_problem &&
+              {processing ? <LoadingNotice className="batch-progress">
+                Reading {processingCount} {processingCount === 1 ? "document" : "documents"}…
+              </LoadingNotice> : active.documents.length > 0 && active.verification_problem &&
                 <p className="notice" role="status">{active.verification_problem}</p>}
               <div className="batch-stats">
                 <div><span>Source files</span><strong>{active.documents.length}</strong><small>{quotes} supplier {quotes === 1 ? "offer" : "offers"}</small></div>
                 <div><span>Findings</span><strong>{verified ? active.issues.length : "—"}</strong><small>{verified ? `${blocked} blocking · ${warnings} warnings` : "Awaiting verification"}</small></div>
                 <div><span>Purchase scope</span><strong className="stat-label">{active.scope_mode === "unknown" ? "Unset" : active.scope_mode === "all" ? "All BOM items" : `${active.scope.length} selected`}</strong>
                   <small>{active.scope_mode === "unknown" ? "Set from the BOM preview" : "Applied to coverage checks"}</small></div>
-                <div><span>Verification</span><strong className="stat-label">{processing ? "Extracting" : verified ? "Verified" : active.stale ? "Out of date" : "Not run"}</strong>
-                  <small>{verified && active.verified_at ? new Date(active.verified_at).toLocaleString("en-PH") : "Local deterministic checks"}</small></div>
+                <div><span>Verification</span><strong className="stat-label">{working ? "Checking" : processing ? "Waiting for files" : verified ? "Verified" : active.stale ? "Out of date" : "Not run"}</strong>
+                  <small>{verified && active.verified_at ? new Date(active.verified_at).toLocaleString("en-PH") : active.stale ? "Run verification again" : "Checks against purchase scope"}</small></div>
               </div>
             </header>
             <section className="panel workspace-panel">
@@ -225,23 +225,14 @@ export function Workspace() {
 }
 
 function Welcome({ project, start }: { project?: Project; start: () => void }) {
-  const steps = [
-    { Icon: FolderPlus, label: "Organize a purchase", text: "Keep procurement rounds and supplier files together by project." },
-    { Icon: Files, label: "Add your sources", text: "Upload one bill of materials and up to five PDF or Excel quotations." },
-    { Icon: FileSearch, label: "Review the evidence", text: "Inspect source highlights, resolve findings, and compare offers." },
-  ];
   return <section className="welcome">
     <div className="welcome-top">
-      <span className="eyebrow"><ScanLine size={17} /> PROCUREMENT WORKSPACE</span>
-      <h1>{project ? project.name : "Procurement verification"}</h1>
-      <p>{project ? "Create a procurement batch for your next purchase round." :
-        "Check supplier quotations against material requirements and trace every finding back to the original document."}</p>
+      <h1>{project ? project.name : "Review supplier quotations"}</h1>
+      <p>{project ? "Create a batch for the materials you’re purchasing." :
+        "Add a bill of materials and up to five quotations. Review each difference alongside the original documents."}</p>
       <button className="button primary" type="button" onClick={start}>
-        <Plus size={18} /> {project ? "Create batch" : "Create project"} <ArrowRight size={16} /></button>
+        <Plus size={18} /> {project ? "Create batch" : "Create project"}</button>
     </div>
-    <div className="workflow-grid">{steps.map(({ Icon, label, text }, index) => <article key={label}>
-      <div><Icon size={22} /><span>0{index + 1}</span></div><h2>{label}</h2><p>{text}</p>
-    </article>)}</div>
   </section>;
 }
 
@@ -251,26 +242,28 @@ function NameDialog({ title, label, initial = "", submit, close, save, remove, d
 }) {
   const [value, setValue] = useState(initial);
   const [error, setError] = useState("");
-  const [working, setWorking] = useState(false);
+  const [working, setWorking] = useState<"save" | "remove" | null>(null);
   const [confirm, setConfirm] = useState(false);
-  async function act(action: () => Promise<void>) {
-    setWorking(true); setError("");
+  async function act(kind: "save" | "remove", action: () => Promise<void>) {
+    setWorking(kind); setError("");
     try { await action(); close(); }
     catch (error) { setError((error as Error).message); }
-    finally { setWorking(false); }
+    finally { setWorking(null); }
   }
-  return <Modal title={title} close={close}>
+  return <Modal title={title} close={close} busy={working !== null}>
     <form className="modal-body stack" onSubmit={(event) => {
       event.preventDefault();
-      if (save && value.trim()) void act(() => save(value.trim()));
+      if (save && value.trim()) void act("save", () => save(value.trim()));
     }}>
       {label ? <label>{label}<input value={value} maxLength={120} required onChange={(event) => setValue(event.target.value)} /></label>
         : <p>{initial}</p>}
       {error && <p className="error" role="alert">{error}</p>}
-      {save && <button className="button primary" type="submit" disabled={working || !value.trim()}>{submit}</button>}
+      {save && <PendingButton className="button primary" type="submit" disabled={working !== null || !value.trim()}
+        pending={working === "save"} pendingLabel={submit?.startsWith("Create") ? "Creating…" : "Saving…"}>{submit}</PendingButton>}
       {remove && (confirm ? <div className="notice"><strong>{deletion}?</strong><div className="inline">
-        <button className="button danger" type="button" disabled={working} onClick={() => void act(remove)}>Confirm removal</button>
-        <button className="button secondary" type="button" onClick={() => setConfirm(false)}>Cancel</button>
+        <PendingButton className="button danger" type="button" disabled={working !== null}
+          pending={working === "remove"} pendingLabel="Removing…" onClick={() => void act("remove", remove)}>Confirm removal</PendingButton>
+        <button className="button secondary" type="button" disabled={working !== null} onClick={() => setConfirm(false)}>Cancel</button>
       </div></div> : <button className="button danger" type="button" onClick={() => setConfirm(true)}>{deletion}</button>)}
     </form>
   </Modal>;
@@ -282,21 +275,23 @@ function UploadDialog({ batch, revises, update, close }: {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [files, setFiles] = useState<File[]>([]);
-  const [useGemini, setUseGemini] = useState(false);
-  const gemini = batch.ai.provider === "gemini";
-  return <Modal title={revises ? "Upload revised quotation" : "Add BOM and supplier quotation files"} close={close}>
+  const [share, setShare] = useState(false);
+  const [uploaded, setUploaded] = useState(0);
+  const sharingAvailable = batch.ai.provider === "gemini" && batch.ai.configured;
+  return <Modal title={revises ? "Upload revised quotation" : "Add BOM and supplier quotation files"} close={close} busy={busy}>
     <form className="modal-body stack" onSubmit={async (event) => {
-      event.preventDefault(); setBusy(true); setError("");
+      event.preventDefault(); setBusy(true); setUploaded(0); setError("");
       const failures: string[] = [];
       const remaining: File[] = [];
       try {
         for (const file of files) {
           const data = new FormData();
           data.append("file", file);
-          if (gemini && batch.ai.configured && useGemini) data.append("use_gemini", "true");
+          if (sharingAvailable && share) data.append("use_gemini", "true");
           if (revises) data.append("revises", revises.id);
           try { await api(`/batches/${batch.id}/documents`, "POST", data); }
           catch (error) { remaining.push(file); failures.push(`${file.name}: ${(error as Error).message}`); }
+          finally { setUploaded((count) => count + 1); }
         }
         update(await api<Batch>(`/batches/${batch.id}`));
         if (failures.length) { setFiles(remaining); setError(failures.join(" • ")); } else close();
@@ -304,7 +299,7 @@ function UploadDialog({ batch, revises, update, close }: {
       finally { setBusy(false); }
     }}>
       <p>{revises ? `Revision of ${revises.name}. The original stays available in this batch.` :
-        "SuriQ identifies document types from their contents. Originals stay in the local workspace."}</p>
+        "Add the bill of materials and supplier quotations for this purchase."}</p>
       <label className="file-field" onDragOver={(event) => event.preventDefault()} onDrop={(event) => {
         event.preventDefault();
         if (!busy) setFiles(Array.from(event.dataTransfer.files).slice(0, revises ? 1 : undefined));
@@ -312,12 +307,17 @@ function UploadDialog({ batch, revises, update, close }: {
         <input type="file" name="file" accept=".pdf,.xlsx,.docx" multiple={!revises} disabled={busy}
           onChange={(event) => setFiles(Array.from(event.currentTarget.files ?? []))} /></label>
       {files.length > 0 && <p className="muted">{files.map((file) => file.name).join(", ")}</p>}
-      {gemini && (batch.ai.configured ? <label className="inline">
-        <input type="checkbox" checked={useGemini} disabled={busy} onChange={(event) => setUseGemini(event.target.checked)} />
-        Allow Gemini to receive excerpts and page images from these non-confidential files
-      </label> : <p className="notice">Native extraction will run. Gemini needs an API key.</p>)}
+      {sharingAvailable && <label className="inline sharing-consent">
+        <input type="checkbox" checked={share} disabled={busy} onChange={(event) => setShare(event.target.checked)} />
+        <span>Allow assisted reading<small>Google may receive excerpts and page images. Select only for non-confidential files.</small></span>
+      </label>}
+      {busy && <div className="upload-progress">
+        <div className="inline" role="status"><Spinner />{uploaded < files.length
+          ? `Uploading file ${uploaded + 1} of ${files.length}` : "Opening uploaded files…"}</div>
+        <progress aria-label="Upload progress" value={uploaded} max={files.length} />
+      </div>}
       {error && <p className="error" role="alert">{error}</p>}
-      <button type="submit" className="button primary" disabled={busy || !files.length}>{busy ? "Uploading…" : "Upload and extract"}</button>
+      <button type="submit" className="button primary" aria-busy={busy} disabled={busy || !files.length}>{busy ? "Uploading…" : "Upload and extract"}</button>
     </form>
   </Modal>;
 }

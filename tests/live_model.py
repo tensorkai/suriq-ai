@@ -51,6 +51,9 @@ def main():
             assert doc["provenance"]["inference"] == "processed", doc["error"]
             assert doc["role"] == "quote" and doc["lines"], doc["classification"]
             assert any(line["fields"].get("quantity") == "80" for line in doc["lines"])
+            if use_gemini:
+                from service.verification import decimal_value
+                assert any(decimal_value(line["fields"].get("amount", "")) == 8000 for line in doc["lines"])
             for line in doc["lines"]:
                 assert all(anchor["boxes"] and anchor["weak"] for anchor in line["anchors"].values())
             ok(client.patch(f"/batches/{batch}/scope", json={"mode": "all"}))

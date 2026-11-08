@@ -51,3 +51,11 @@ The full API suite passed 31 tests. The Gemini tests intercepted the HTTPS trans
 ## Summary-only PDF quotations
 
 The full API regression suite passed 32 tests. The added synthetic case covers centered headers, right-aligned prices, a draft quotation with only summary amounts, and suppression of item findings and partial-scope comparisons. The supplied PDF pair was reprocessed locally in the running app. All 36 BOM rows summed to PHP 386,938.68, and the quotation stated PHP 387,337.68 for materials. Chromium displayed the PHP 399.00 finding with highlights on BOM page 2 and quotation page 1. CSV export passed. Item coverage remained unverified.
+
+## Priced BOM/BOQ schedules
+
+The native PDF parser recognized the two-level material and labor headers in both supplied BOQs. The six-page file retained three separate supplier/site schedules with 42 material and 15 service rows. The two-page file retained 14 material and 5 service rows. All four material extension sums matched the printed amounts. Production Chromium showed the schedule summaries and separate price columns. The existing batch correctly requires one baseline BOM, and the synthetic API regression verifies that selected scope and item matching stay inside one schedule.
+
+## Workspace loading states
+
+Chromium held workspace, upload, verification, page preview, and correction requests open long enough to verify that their loading indicators appeared and cleared. The same workflow checked the unchecked sharing control, grouped source highlights, keyboard navigation, review persistence, exports, activity labels, and a 390 px viewport. The API suite passed all 33 tests.

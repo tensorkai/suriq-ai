@@ -2,9 +2,9 @@
 
 import { Check, ClipboardList, LocateFixed, ScanLine, ShieldCheck } from "lucide-react";
 import { useState } from "react";
-import { api, docName, reviews, sourceName } from "./model";
+import { api, docName, documentFeedback, reviews, sourceName } from "./model";
 import type { Anchor, Batch, Issue, ReviewStatus } from "./model";
-import { Empty, Pill } from "./shared";
+import { Empty, PendingButton, Pill } from "./shared";
 import { SourceViewer, Zoom } from "./viewer";
 
 export function Findings({ batch, update }: { batch: Batch; update: (batch: Batch) => void }) {
@@ -33,7 +33,7 @@ export function Findings({ batch, update }: { batch: Batch; update: (batch: Batc
 
   return <div className="findings-layout">
     <aside className="issue-rail">
-      <div className="issue-rail-heading"><span>ISSUE TABS</span><span>{items.length}</span></div>
+      <div className="issue-rail-heading"><span>Findings</span><span>{items.length}</span></div>
       <label className="sr-only" htmlFor="severity-filter">Filter by severity</label>
       <select id="severity-filter" value={filter} onChange={(event) => setFilter(event.target.value)}>
         <option value="all">All severities</option><option>Blocking</option><option>Warning</option><option>Info</option>
@@ -63,7 +63,7 @@ export function Findings({ batch, update }: { batch: Batch; update: (batch: Batc
       <div className="issue-summary">
         <div className="inline"><Pill value={issue.severity} /><Pill value={reviews[issue.review.status]} />
           {issue.review_required && <Pill value="Needs review" />}</div>
-        <h2>{issue.title}</h2><p>{issue.note}</p>
+        <h2>{issue.title}</h2><p>{documentFeedback(issue.note)}</p>
         <ReviewForm key={`${issue.id}:${issue.fingerprint}:${issue.review.status}:${issue.review.note}`}
           batch={batch.id} issue={issue} update={update} />
       </div>
@@ -109,7 +109,8 @@ function ReviewForm({ batch, issue, update }: { batch: string; issue: Issue; upd
     </select></label>
     <label className="grow">Internal note<input placeholder="Optional review note" value={note} maxLength={500}
       onChange={(event) => setNote(event.target.value)} /></label>
-    <button className="button secondary" disabled={busy} type="submit"><Check size={15} /> Save review</button>
+    <PendingButton className="button secondary" type="submit" pending={busy} pendingLabel="Saving review…"
+      icon={<Check size={15} />}>Save review</PendingButton>
     {error && <p className="error" role="alert">{error}</p>}
     {saved && <span role="status" className="fine-print">Review saved.</span>}
   </form>;

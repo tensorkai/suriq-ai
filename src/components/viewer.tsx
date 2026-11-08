@@ -3,8 +3,9 @@
 import { ChevronLeft, ChevronRight, Download, FileWarning, LocateFixed, Minus, Plus } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
 import type { PointerEvent } from "react";
-import { docName, sourceName } from "./model";
+import { docName, documentFeedback, sourceName } from "./model";
 import type { Anchor, Box, Document } from "./model";
+import { LoadingNotice } from "./shared";
 
 export type Link = { source: number | string; cell?: string; box?: Box; text?: string };
 
@@ -24,7 +25,7 @@ export function SourceViewer({ doc, initial, anchors = [], zoom = 100, onLink, d
   const [selection, setSelection] = useState({ source: initial ?? doc.sources[0]?.ref, focus });
   const selected = selection.focus === focus ? selection.source : initial;
   const select = (source: number | string) => setSelection({ source, focus });
-  const [imageError, setImageError] = useState<number | string>();
+  const [imageState, setImageState] = useState<Record<string, "ready" | "failed">>({});
   const start = useRef<[number, number] | null>(null);
   const pane = useRef<HTMLDivElement>(null);
   const lastFocus = useRef(focus);
@@ -50,6 +51,8 @@ export function SourceViewer({ doc, initial, anchors = [], zoom = 100, onLink, d
   if (!source) {
     return <div className="empty small"><FileWarning size={22} /> Source preview is unavailable.</div>;
   }
+  const previewState = imageState[source.ref];
+  const previewReady = previewState === "ready";
   const scoped = anchors.filter((anchor) => anchor.source === source.ref);
   const sheet = source.rows ?? [];
   const marked = new Set(scoped.flatMap((anchor) => anchor.cells ?? []));
@@ -81,21 +84,21 @@ export function SourceViewer({ doc, initial, anchors = [], zoom = 100, onLink, d
       </select>
       <button className="icon-button" type="button" aria-label="Next source" disabled={index === doc.sources.length - 1}
         onClick={() => select(doc.sources[index + 1].ref)}><ChevronRight size={16} /></button>
-      <span className="source-method">{doc.kind === "docx" ? "DOCX STRUCTURE" : source.method === "cells" ? "WORKSHEET" : source.method === "ocr" ? "OCR" : "PDF TEXT"}</span>
+      <span className="source-method">{doc.kind === "docx" ? "Document excerpt" : source.method === "cells" ? "Worksheet" : source.method === "ocr" ? "Scanned page" : "PDF page"}</span>
     </div>
     {doc.kind === "docx" && <p className="source-warning">Structured source reference. Precise page highlighting is unavailable.
       {" "}<a href={`${path}/rendered`} target="_blank" rel="noreferrer">Open paginated preview</a>
     </p>}
-    {source.warning && <p className="source-warning"><FileWarning size={15} /> {source.warning}</p>}
+    {source.warning && <p className="source-warning"><FileWarning size={15} /> {documentFeedback(source.warning)}</p>}
     {doc.kind === "pdf" ? <div className="paper-scroll" ref={pane}>
-      {imageError === source.ref ? <p className="empty small">Page rendering failed. Download the original to inspect it.</p> :
-        <div className={`pdf-page ${onLink ? "marking" : ""}`} style={{ width: `${zoom}%` }}
-          onPointerDown={onLink ? (event) => {
+      {previewState === "failed" ? <p className="empty small">Could not open this page. Download the original to view it.</p> :
+        <div className={`pdf-page ${onLink && previewReady ? "marking" : ""}`} style={{ width: `${zoom}%` }}
+          onPointerDown={onLink && previewReady ? (event) => {
             if (event.button !== 0) return;
             start.current = position(event);
             event.currentTarget.setPointerCapture(event.pointerId);
           } : undefined}
-          onPointerUp={onLink ? (event) => {
+          onPointerUp={onLink && previewReady ? (event) => {
             if (!start.current) return;
             const [x, y] = start.current;
             const [endX, endY] = position(event);
@@ -104,15 +107,18 @@ export function SourceViewer({ doc, initial, anchors = [], zoom = 100, onLink, d
             if (box[2] > .003 && box[3] > .003) onLink({ source: source.ref, box });
           } : undefined}
           onPointerCancel={() => { start.current = null; }}>
+          {!previewReady && <LoadingNotice className="preview-loading">Loading {sourceName(source.ref).toLowerCase()}…</LoadingNotice>}
           {/* eslint-disable-next-line @next/next/no-img-element -- raster source coordinates are intrinsic */}
-          <img src={`${path}/page/${source.ref}`} alt={`Full source ${sourceName(source.ref)} of ${doc.name}`}
+          <img key={source.ref} className={previewReady ? "" : "preview-pending"} src={`${path}/page/${source.ref}`} alt={`Full source ${sourceName(source.ref)} of ${doc.name}`}
             style={source.width && source.height ? { aspectRatio: `${source.width} / ${source.height}` } : undefined}
-            draggable={false} loading="lazy" onError={() => setImageError(source.ref)} />
-          {scoped.flatMap((anchor, i) => (anchor.boxes ?? []).map(([x, y, w, h], j) =>
+            draggable={false} loading="lazy"
+            onLoad={() => setImageState((state) => ({ ...state, [source.ref]: "ready" as const }))}
+            onError={() => setImageState((state) => ({ ...state, [source.ref]: "failed" as const }))} />
+          {previewReady && scoped.flatMap((anchor, i) => (anchor.boxes ?? []).map(([x, y, w, h], j) =>
             <span key={`${i}-${j}`} className="evidence-box" title={anchor.text} style={{
               left: `${x * 100}%`, top: `${y * 100}%`, width: `${w * 100}%`, height: `${h * 100}%`,
             }} />))}
-          {draft?.source === source.ref && draft.box && <span className="evidence-box draft" style={{
+          {previewReady && draft?.source === source.ref && draft.box && <span className="evidence-box draft" style={{
             left: `${draft.box[0] * 100}%`, top: `${draft.box[1] * 100}%`,
             width: `${draft.box[2] * 100}%`, height: `${draft.box[3] * 100}%`,
           }} />}
@@ -132,7 +138,7 @@ export function SourceViewer({ doc, initial, anchors = [], zoom = 100, onLink, d
     </div>}
     {scoped.length > 0 && <ul className="evidence-text" aria-label="Highlighted evidence">
       {scoped.map((anchor, idx) => <li key={idx}><LocateFixed size={14} />
-        <span>{anchor.cells?.length ? `${anchor.cells.join(", ")} · ` : ""}{anchor.text || "Source needs review"}
+        <span>{anchor.cells?.length ? `${anchor.cells.join(", ")} · ` : ""}{(anchor.weak && !anchor.cells?.length && !anchor.boxes?.length ? documentFeedback(anchor.text) : anchor.text) || "Source needs review"}
           {!anchor.cells?.length && !anchor.boxes?.length ? " · Precise anchor unavailable" : anchor.weak ? " · Needs review" : ""}
         </span>
       </li>)}

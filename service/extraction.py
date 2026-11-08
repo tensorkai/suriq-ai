@@ -18,7 +18,7 @@ MAX_ROWS = int(os.getenv("SURIQ_MAX_ROWS", "500"))
 MAX_COLUMNS = 64
 OCR_CONFIDENCE = int(os.getenv("SURIQ_OCR_CONFIDENCE", "75"))
 NS = "{http://www.w3.org/1999/xhtml}"
-PARSER_VERSION = "native-2.2"
+PARSER_VERSION = "native-2.3"
 
 LINE_FIELDS = {
     "code": "item id|bom item id|id|item no|item number|no|code|part no|part number|sku",
@@ -35,6 +35,9 @@ LINE_FIELDS = {
     "pack": "pack|pack size|packaging|packaging size",
     "unit_price": "unit price|unit cost|price|rate|estimated unit cost|estimated unit price|unit price php|price per unit",
     "amount": "line total|total price|amount|total|line amount|amount php|extended|extended amount|extension",
+    "labor_unit_price": "labor unit rate|labour unit rate|labor unit price",
+    "labor_amount": "labor extension|labour extension",
+    "line_total": "combined line total",
     "delivery_date": "delivery date|needed by|required delivery date",
     "lead_time": "lead time|delivery lead time",
 }
@@ -71,7 +74,7 @@ ATTRIBUTES = {
 }
 UNIT_PATTERN = (
     r"pcs?|pieces?|bags?|sacks?|lengths?|sets?|rolls?|pail[s]?|packs?|kg|g|MT|tonnes?|"
-    r"units?|ft|feet|mm|cm|m|sqm|sq\.?\s*m|m²|m2|cu\.?\s*m|m³|m3|l|liters?"
+    r"lots?|units?|ft|feet|mm|cm|m|sqm|sq\.?\s*m|m²|m2|cu\.?\s*m|m³|m3|l|liters?"
 )
 NUMBER_PATTERN = r"(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]+)?"
 PRICE_PATTERN = rf"(?:(?:Php|₱)\s*)?{NUMBER_PATTERN}"
@@ -83,6 +86,26 @@ FALLBACK_LINE = re.compile(rf"^(?:(?P<code>[A-Z]+[-.]\d+)\s+)?{MATERIAL_ROW}$", 
 NUMBERED_LINE = re.compile(rf"^(?P<code>\d+|[A-Z]+[-.]\d+)\s+{MATERIAL_ROW}$", re.I)
 PDF_MONEY_FIELDS = {"subtotal", "total", "vat", "freight", "discount", "materials_total",
                     "item_extensions_total", "labor_equipment", "mobilization", "advance_payment", "balance_payment"}
+
+# In this BOQ layout the upper header identifies cost categories and the
+# lower header distinguishes unit rates from extensions.
+SPLIT_HEADER = re.compile(
+    r"^(?:no|item no)\s+(?:specification / work item|description|work item)\s+(?:qty|quantity)\s+unit\s+"
+    r"material labou?r material labou?r line$", re.I,
+)
+SPLIT_SUBHEADER = re.compile(r"^unit rate unit rate extension extension total$", re.I)
+DRAFT_MARK = re.compile(r"reconstructed\s*/\s*not issued", re.I)
+SCHEDULE_PRICE_FIELDS = ("unit_price", "labor_unit_price", "amount", "labor_amount", "line_total")
+SCHEDULE_ROW = re.compile(
+    rf"^(?P<code>\d+|[A-Z]+[-.]\d+)\s+(?P<material>.+?)\s+(?P<quantity>{NUMBER_PATTERN})\s+"
+    rf"(?P<unit>{UNIT_PATTERN})" +
+    "".join(rf"\s+(?P<{field}>{PRICE_PATTERN}|[-–—])" for field in SCHEDULE_PRICE_FIELDS) + "$", re.I,
+)
+SCHEDULE_TOTAL_LABELS = {
+    "materials extension", "extended material costs", "extended labor / site services",
+    "extended labour / site services", "total detailed schedule", "quoted project total",
+    "unclassified difference to quotation", "non-schedule profit / tax provisions",
+}
 
 
 class ExtractionError(ValueError):
@@ -308,6 +331,54 @@ def pdf_term(raw):
     return None
 
 
+def split_schedule(snapshot, source, rows):
+    """Read a priced BOQ only when both levels of its header agree."""
+    texts = [" ".join(word[0] for word in row) for row in rows]
+    header = next((i for i, raw in enumerate(texts[:-1]) if SPLIT_HEADER.fullmatch(label(raw))
+                   and SPLIT_SUBHEADER.fullmatch(label(texts[i + 1]))), None)
+    if header is None:
+        return False
+
+    ref = source["ref"]
+    issuer = site = ""
+    for index, raw in enumerate(texts[:header]):
+        keep_heading(snapshot, word_anchor(ref, rows[index]), True)
+        if draft := DRAFT_MARK.search(raw):
+            issuer = issuer or raw[:draft.start()].strip()
+            add_term(snapshot, ("draft_notice", draft.group(), word_anchor(ref, words_in_span(rows[index], *draft.span()))))
+        if location := re.search(r"\bproject site:\s*(.+)$", raw, re.I):
+            site = location[1].strip()
+        if supplier := re.match(r"^(?:supplier|contractor):\s*(.+)$", raw, re.I):
+            issuer = issuer or supplier[1].strip()
+    source["schedule"] = " · ".join(part for part in (issuer, site) if part) if issuer else f"Unidentified schedule · page {ref}"
+    source["schedule_totals"] = []
+    service_page = any(re.search(r"\bnon[- ]material services\b", raw, re.I) for raw in texts[:header])
+    count = 0
+    for index in range(header + 2, len(rows)):
+        raw, row = texts[index], rows[index]
+        if match := SCHEDULE_ROW.fullmatch(raw):
+            fields = match.groupdict()
+            groups = {field: words_in_span(row, *match.span(field)) for field in fields}
+            anchors = {field: word_anchor(ref, words) for field, words in groups.items()}
+            line = make_line(ref, index + 1, fields, anchors, groups)
+            service = service_page or fields["unit_price"] in {"-", "–", "—"} and fields["amount"] in {"-", "–", "—"}
+            line.update({"kind": "service" if service else "material", "schedule": source["schedule"]})
+            snapshot["lines"].append(line)
+            count += 1
+            continue
+        total = re.fullmatch(rf"(?P<label>.+?)\s+(?P<value>{PRICE_PATTERN})", raw, re.I)
+        if total and label(total["label"]) in SCHEDULE_TOTAL_LABELS:
+            source["schedule_totals"].append({
+                "label": total["label"], "value": total["value"],
+                "anchor": word_anchor(ref, words_in_span(row, *total.span("value"))),
+            })
+        elif re.match(r"^\d+\s", raw) and re.search(rf"\s{NUMBER_PATTERN}\s+(?:{UNIT_PATTERN})\b", raw, re.I):
+            source["warning"] = source["warning"] or "A numbered schedule row did not match the printed price columns. Review this page."
+    if not count:
+        source["warning"] = source["warning"] or "No priced schedule rows were recognized. Review this page."
+    return True
+
+
 def pdf_rows(snapshot, source, rows, inherited):
     columns = inherited
     previous = None
@@ -430,7 +501,10 @@ def extract_pdf(path, snapshot, directory, pdf_words):
             source["warning"] = "Low-confidence OCR. Check the extracted values against this page."
         snapshot["sources"].append(source)
         pdf_words[page] = row_groups(words)
-        columns = pdf_rows(snapshot, page, pdf_words[page], columns)
+        if split_schedule(snapshot, source, pdf_words[page]):
+            columns = []
+        else:
+            columns = pdf_rows(snapshot, page, pdf_words[page], columns)
     if len(snapshot["sources"]) != int(pages[1]):
         raise ExtractionError("Could not index every PDF page.")
 

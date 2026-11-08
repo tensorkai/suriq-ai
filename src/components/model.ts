@@ -8,11 +8,14 @@ export type Source = {
   warning: string;
   width?: number;
   height?: number;
+  schedule?: string;
+  schedule_totals?: { label: string; value: string; anchor: Anchor }[];
   rows?: { row: number; cells: Record<string, string> }[];
 };
 export type Line = {
   id: string; fields: Record<string, string>; anchors: Record<string, Anchor>;
   original: string; match?: string; factor?: string; excluded?: boolean;
+  kind?: "material" | "service"; schedule?: string;
 };
 export type Document = {
   id: string; name: string; kind: "pdf" | "xlsx" | "docx"; role: "bom" | "quote" | "unknown" | "mixed" | "unsupported";
@@ -51,7 +54,8 @@ export const lineFields: Record<string, string> = {
   code: "Item ID", material: "Material", description: "Description", quantity: "Quantity",
   unit: "Unit", specification: "Specification", dimension: "Dimension", grade: "Grade",
   standard: "Required standard", brand: "Required brand / offered brand", preferred_brand: "Preferred brand",
-  pack: "Pack size", unit_price: "Unit price", amount: "Line amount",
+  pack: "Pack size", unit_price: "Material unit price", amount: "Material extension",
+  labor_unit_price: "Labor unit rate", labor_amount: "Labor extension", line_total: "Combined line total",
   delivery_date: "Delivery date", lead_time: "Lead time",
 };
 
@@ -68,6 +72,10 @@ export const termFields: Record<string, string> = {
 export const reviews: Record<ReviewStatus, string> = {
   open: "Open", confirmed: "Confirmed", false_positive: "False positive", clarification: "Needs clarification",
 };
+
+export function procurementRows(lines: Line[]) {
+  return lines.filter((line) => !line.excluded && line.kind !== "service");
+}
 
 export function docName(doc: Document) {
   if (doc.role === "bom") return "Bill of materials";
@@ -88,6 +96,26 @@ export function amount(value: string | null | undefined, currency = "PHP") {
   return `${currency === "PHP" ? "₱" : `${currency} `}${display}${decimal === undefined ? "" : `.${decimal}`}`;
 }
 
+export function documentFeedback(value: string) {
+  if (/^The local interpretation found conflicting/i.test(value)) {
+    return "The document contains conflicting type indicators. Check the cited sections.";
+  }
+  if (/^(?:Confirm sharing with Gemini|AI assistance is disabled)/i.test(value)) {
+    return "Matching suggestions are unavailable. Select a material manually.";
+  }
+  if (/^(?:AI model|Gemini|Local (?:Ollama|model|inference|AI|interpretation)|AI interpretation|The configured model|Configure an installed local Ollama model|Add a Gemini API key)/i.test(value)) {
+    if (/quota|rate limit|timeout|timed out|unreachable/i.test(value)) {
+      return "Document reading is temporarily unavailable. Try again or review the source.";
+    }
+    if (/ambiguous|cited|source element|source\b.*uniquely|conflicts|unlinked|unrelated|duplicate/i.test(value)) {
+      return "Some values could not be linked to the source with confidence. Review the affected page.";
+    }
+    if (/limit reached/i.test(value)) return "Some pages still need review. Check the source for missing rows.";
+    return "Some document details could not be read. Review the source or try again.";
+  }
+  return value;
+}
+
 export async function api<T>(path: string, method = "GET", payload?: unknown): Promise<T> {
   const headers = new Headers({ "X-SuriQ-Request": "1" });
   const form = payload instanceof FormData;
@@ -100,7 +128,7 @@ export async function api<T>(path: string, method = "GET", payload?: unknown): P
   if (!response.ok) {
     const detail = data.detail;
     const message = Array.isArray(detail) ? detail.map((entry) => entry.msg).join(" ") : detail;
-    throw new Error(message || `Request failed (${response.status}).`);
+    throw new Error(typeof message === "string" && message ? documentFeedback(message) : "Could not complete the request. Try again.");
   }
   return data as T;
 }

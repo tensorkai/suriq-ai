@@ -98,7 +98,8 @@ def apply_fields(values, anchors, changes):
     for field, value in changes.get("values", {}).items():
         anchor = anchors.get(field)
         if anchor and value != values.get(field):
-            numeric = field in {"quantity", "unit_price", "amount", "subtotal", "total", "freight", "vat", "discount"}
+            numeric = field in {"quantity", "unit_price", "amount", "labor_unit_price", "labor_amount", "line_total",
+                                "subtotal", "total", "freight", "vat", "discount"}
             left = r"(?<!\w)(?<!\d[.,])" if numeric else r"(?<!\w)"
             right = r"(?!\w|[.,]\d)" if numeric else r"(?!\w)"
             if not value or not re.search(left + re.escape(value) + right, anchor["text"], re.I):

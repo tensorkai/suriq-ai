@@ -82,10 +82,10 @@ def report(batch, extension):
     output = BytesIO()
     styles = getSampleStyleSheet()
     styles["Title"].textColor = colors.HexColor("#19392e")
-    story = [Paragraph("SuriQ AI | Verification report", styles["Title"]), Spacer(1, 14)]
+    story = [Paragraph("SuriQ | Verification report", styles["Title"]), Spacer(1, 14)]
     for heading, *values in rows:
         text = escape(" · ".join(str(v) for v in values if v)).replace("\n", "<br/>")
         style = styles["Heading3"] if heading in {"Issue", "Supplier"} else styles["BodyText"]
         story.append(Paragraph(f"<b>{heading}</b>  {text}", style))
-    SimpleDocTemplate(output, title="SuriQ AI Verification Report").build(story)
+    SimpleDocTemplate(output, title="SuriQ Verification Report").build(story)
     return output.getvalue(), "application/pdf"

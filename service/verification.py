@@ -192,6 +192,23 @@ def uncertain_source(doc):
             or any(anchor.get("weak") for line in doc["lines"] for anchor in line["anchors"].values()))
 
 
+def one_schedule(lines, scope_mode, scope):
+    selected = lines if scope_mode == "all" else [line for line in lines if line["id"] in scope]
+    return len({line.get("schedule") for line in selected}) <= 1
+
+
+def schedule_baseline(lines, scope_mode, scope):
+    """Match duplicate codes only within the schedule chosen for the purchase."""
+    if len({line.get("schedule") for line in lines}) <= 1:
+        return lines
+    if scope_mode != "selected":
+        return []
+    schedules = {line.get("schedule") for line in lines if line["id"] in scope}
+    if len(schedules) != 1:
+        return []
+    return [line for line in lines if line.get("schedule") in schedules]
+
+
 def verify(documents, scope_mode, scope, as_of=None):
     with localcontext() as context:
         context.prec = 60
@@ -202,7 +219,7 @@ def verify_in_context(documents, scope_mode, scope, as_of):
     as_of = as_of or datetime.now(ZoneInfo("Asia/Manila")).date()
     bom = next(doc for doc in documents if doc["role"] == "bom")
     quotes = [doc for doc in documents if doc["role"] == "quote"]
-    baseline = {line["id"]: line for line in bom["lines"]}
+    baseline = {line["id"]: line for line in schedule_baseline(bom["lines"], scope_mode, scope)}
     required = {key: line for key, line in baseline.items()
                 if scope_mode == "all" or (scope_mode == "selected" and key in scope)}
     issues = {}

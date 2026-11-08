@@ -47,7 +47,7 @@ Open [the local workspace](http://127.0.0.1:3000). For the production build, kee
 5. Run verification. Review the grouped source cards in **Findings** and save a decision. Use **Focus highlights** to center the relevant regions across the linked documents.
 6. Review the supplier matrix, including reasons for incomparable totals, then download PDF or CSV from **Export**.
 
-Use **Upload revision** on a current quotation when a supplier sends an updated offer. The old file remains in the batch as a superseded source once the revision is accepted. If extraction fails or the service restarts during processing, use **Retry extraction**. Check the original when extraction returns few rows or flags OCR. The SQLite database is created at `.suriq/workspace.sqlite` and contains the originals, results, and audit history. Stop the service before copying the database as a backup. Treat backups and downloaded reports as procurement records.
+Use **Upload revision** on a current quotation when a supplier sends an updated offer. The old file remains in the batch as a superseded source once the revision is accepted. If extraction fails or the service restarts during processing, use **Try reading again**. Check the original when extraction returns few rows or flags OCR. The SQLite database is created at `.suriq/workspace.sqlite` and contains the originals, results, and audit history. Stop the service before copying the database as a backup. Treat backups and downloaded reports as procurement records.
 
 ## Gemini 3.1 Flash-Lite
 
@@ -74,7 +74,7 @@ set +a
 SURIQ_AI_PROVIDER=gemini .venv/bin/python -m uvicorn service.api:app --factory --host 127.0.0.1 --port 8765
 ```
 
-Opt in for each non-confidential upload or retry that can use hosted assistance. Gemini receives selected text and PDF page images over HTTPS. Native extraction, original files, source validation, and verification stay local. Google may use free-tier submissions to improve its products. Use Ollama for confidential procurement documents. [Gemini terms](https://ai.google.dev/gemini-api/terms) · [Free-tier pricing](https://ai.google.dev/gemini-api/docs/pricing.md)
+Select **Allow assisted reading** for non-confidential uploads or **Try assisted reading** when retrying a document. Gemini receives selected text and PDF page images over HTTPS. Native extraction, original files, source validation, and verification stay local. Google may use free-tier submissions to improve its products. Use Ollama for confidential procurement documents. [Gemini terms](https://ai.google.dev/gemini-api/terms) · [Free-tier pricing](https://ai.google.dev/gemini-api/docs/pricing.md)
 
 To check the live Gemini connection with a generated sample, load `.env` as above and run `SURIQ_AI_PROVIDER=gemini .venv/bin/python -m tests.live_model`.
 
@@ -94,7 +94,7 @@ Start the processing service with local AI enabled.
 SURIQ_ENABLE_OLLAMA=1 .venv/bin/python -m uvicorn service.api:app --factory --host 127.0.0.1 --port 8765
 ```
 
-SuriQ uses the installed model for scan-heavy, ambiguous, or unfamiliar sources. Model-assisted fields keep their parser-owned evidence and a review flag until confirmed against the source. Use **Suggest matches with local AI** in the quotation editor to request candidate BOM rows. Native parsing continues when the model is disabled or unavailable, and unresolved roles block verification. Start with a generous timeout on CPU-only hardware.
+SuriQ uses the installed model for scan-heavy, ambiguous, or unfamiliar sources. Model-assisted fields keep their parser-owned evidence and a review flag until confirmed against the source. Use **Suggest matches** in the quotation editor to request candidate BOM rows. Native parsing continues when the model is disabled or unavailable, and unresolved roles block verification. Start with a generous timeout on CPU-only hardware.
 
 ## Configuration
 

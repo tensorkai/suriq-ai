@@ -3,7 +3,7 @@ import type { NextRequest } from "next/server";
 async function proxy(request: NextRequest, context: RouteContext<"/api/[...path]">) {
   const { path } = await context.params;
   if (!path.length || !["health", "projects", "batches", "documents"].includes(path[0])) {
-    return Response.json({ detail: "Unknown local API route." }, { status: 404 });
+    return Response.json({ detail: "This request is unavailable." }, { status: 404 });
   }
   if (path.some((segment) => segment === "." || segment === ".." || /[/\\\x00-\x1f]/.test(segment))) {
     return Response.json({ detail: "Invalid route." }, { status: 400 });
@@ -17,11 +17,11 @@ async function proxy(request: NextRequest, context: RouteContext<"/api/[...path]
     (origin && origin !== `http://${host}`) ||
     (method !== "GET" && request.headers.get("x-suriq-request") !== "1")
   ) {
-    return Response.json({ detail: "Use the local SuriQ workspace." }, { status: 403 });
+    return Response.json({ detail: "Open SuriQ to complete this request." }, { status: 403 });
   }
   const port = process.env.SURIQ_API_PORT ?? "8765";
   if (!/^\d{1,5}$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
-    return Response.json({ detail: "Invalid local API port." }, { status: 503 });
+    return Response.json({ detail: "The workspace connection is unavailable." }, { status: 503 });
   }
   const url = `http://127.0.0.1:${port}/${path.map(encodeURIComponent).join("/")}`;
   const headers = new Headers();
@@ -59,7 +59,7 @@ async function proxy(request: NextRequest, context: RouteContext<"/api/[...path]
     return new Response(upstream.body, { status: upstream.status, headers: responseHeaders });
   } catch {
     return Response.json(
-      { detail: size > limit ? "Request exceeds the upload limit." : "The local processing service is unavailable." },
+      { detail: size > limit ? "Request exceeds the upload limit." : "The workspace is unavailable. Try again shortly." },
       { status: size > limit ? 413 : 503 },
     );
   }

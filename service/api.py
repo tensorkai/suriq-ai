@@ -23,7 +23,7 @@ from service.extraction import (
 from service.reports import report
 from service.store import Store, apply_overlay, attach_reviews, documents, event, now
 from service.suggestions import suggest
-from service.verification import decimal_value, summary_quote, verify
+from service.verification import decimal_value, one_schedule, schedule_baseline, summary_quote, verify
 
 MAX_UPLOAD = int(os.getenv("SURIQ_MAX_UPLOAD_MB", "20")) * 1024 * 1024
 LOG = logging.getLogger("suriq")
@@ -115,7 +115,7 @@ def load_batch(db, batch):
 
 def active_documents(docs):
     return [{**doc, "has_excluded_rows": any(line.get("excluded") for line in doc["lines"]),
-             "lines": [line for line in doc["lines"] if not line.get("excluded")]}
+             "lines": [line for line in doc["lines"] if not line.get("excluded") and line.get("kind") != "service"]}
             for doc in docs if not doc["superseded_by"]]
 
 
@@ -125,7 +125,7 @@ def verification_problem(docs, scope_mode, scope):
     if any(doc["status"] not in {"ready", "needs_review"} for doc in docs):
         return "Wait for processing or retry failed files."
     if len(boms) > 1:
-        return "Multiple BOMs detected. Correct a document type or remove an extra BOM."
+        return "Multiple BOMs detected. Use one baseline BOM per batch and keep different project sites in separate batches."
     if any(doc["role"] == "unsupported" for doc in docs):
         return "Remove unsupported procurement documents from this batch."
     if any(doc["revises"] and doc["role"] != "quote" for doc in docs):
@@ -140,6 +140,8 @@ def verification_problem(docs, scope_mode, scope):
     baseline = {line["id"] for line in boms[0]["lines"]}
     if scope_mode == "unknown" or (scope_mode == "selected" and (not scope or set(scope) - baseline)):
         return "Set the purchase scope using the current BOM rows."
+    if not one_schedule(boms[0]["lines"], scope_mode, scope):
+        return "Select material rows from one supplier schedule and project site."
     return ""
 
 
@@ -526,7 +528,9 @@ def create_app(path):
                 fail(409, "Resolve the BOM role before selecting purchase scope.")
             rows = sorted(set(data.rows)) if data.mode == "selected" else []
             if rows and set(rows) - {line["id"] for line in boms[0]["lines"]}:
-                fail(422, "Purchase scope must reference rows from this BOM.")
+                fail(422, "Purchase scope must reference material rows from this BOM.")
+            if data.mode != "unknown" and not one_schedule(boms[0]["lines"], data.mode, rows):
+                fail(422, "Select material rows from one supplier schedule and project site.")
             db.execute("UPDATE batches SET scope = ?, scope_mode = ? WHERE id = ?",
                        (json.dumps(rows), data.mode, batch))
             event(db, batch, "set_scope", {"before": [before["scope_mode"], json.loads(before["scope"])],
@@ -568,8 +572,10 @@ def create_app(path):
             if (data.match is not None or data.factor is not None) and (term or doc["role"] != "quote"):
                 fail(422, "Manual matches and conversions apply to quotation lines.")
             if data.match:
-                bom = next((doc for doc in docs if doc["role"] == "bom"), None)
-                if not bom or data.match not in {line["id"] for line in bom["lines"] if not line.get("excluded")}:
+                bom = next((doc for doc in active_documents(docs) if doc["role"] == "bom"), None)
+                scope = get_row(db, "batches", batch, "scope_mode, scope")
+                baseline = schedule_baseline(bom["lines"], scope["scope_mode"], json.loads(scope["scope"])) if bom else []
+                if data.match not in {line["id"] for line in baseline}:
                     fail(422, "Select an existing BOM line.")
             if data.factor and (not decimal_value(data.factor) or decimal_value(data.factor) <= 0 or not data.note):
                 fail(422, "A positive conversion factor requires an explanation.")
@@ -624,7 +630,9 @@ def create_app(path):
             bom = next((doc for doc in docs if doc["role"] == "bom"), None)
             if doc["role"] != "quote" or not line or not bom:
                 fail(422, "An extracted quotation line and a BOM are required.")
-            anchored = [row for row in bom["lines"] if row["anchors"]][:80]
+            scope = get_row(db, "batches", meta["batch"], "scope_mode, scope")
+            material = [row for row in bom["lines"] if row["anchors"] and not row.get("excluded") and row.get("kind") != "service"]
+            anchored = schedule_baseline(material, scope["scope_mode"], json.loads(scope["scope"]))[:80]
         ids, message = suggest(line, anchored, use_gemini=use_gemini)
         return {"candidates": ids, "message": message}
 
