@@ -38,6 +38,18 @@ npm run dev
 
 Open [the local workspace](http://127.0.0.1:3000). For the production build, keep the Python service running and use `npm run build` followed by `npm run start`. Package and model installation require network access. The deterministic workflow runs locally after installation.
 
+## Remotion
+
+Remotion 4.0.541 is installed with the npm dependencies. It runs independently of the web app and Python service:
+
+```sh
+npm run remotion:studio
+```
+
+Open [Remotion Studio](http://localhost:3002). The starter composition, `SuriqIntro`, is registered in `remotion/Root.tsx`; edit `remotion/Intro.tsx` to change it. Studio settings live in `remotion.config.ts`.
+
+When needed, `npm run remotion:render` exports an H.264 video to `out/suriq-intro.mp4`, and `npm run remotion:still` exports a PNG to `out/suriq-intro.png`. These exports are Git-ignored. The first export may download Chrome Headless Shell and require platform-specific browser libraries; exports have not been verified as part of setup. See the [Remotion installation guide](https://www.remotion.dev/docs/brownfield) and [existing video references](VIDEO_REFERENCES.md).
+
 ## Review a batch
 
 1. Create a project and procurement batch.

@@ -62,12 +62,18 @@ def test_summary_and_structured_pdf_share_verified_values(tmp_path, offer_count)
         assert "Supplier Quotation Summary" in pages[0]
         assert "Internal canvass" in pages[0]
         assert "QUOTE-1" in pages[0] and "5,600" in pages[0]
-        for section in ("Scope and sources", "Findings", "Detailed line items", "Page 2"):
+        for section in ("Scope and sources", "Findings", "Commercial terms and evidence", "Detailed line items", "Page 2"):
             assert section in extracted
+        assert re.search(r"Expected or required +Offered or observed", extracted)
+        assert re.search(r"Source and location +Evidence excerpt", extracted)
         assert re.search(r"Confirm the drawing revision\.\s*\n\s*Ask whether the replacement is in stock\.", extracted)
         assert "Materials B2" in extracted
         machine_readable = client.get(f"{route}/export/csv").content.decode("utf-8-sig")
-        assert any(row[0] == "Issue" and row[-1] == note for row in csv.reader(StringIO(machine_readable)))
+        header, *records = csv.reader(StringIO(machine_readable))
+        assert all(len(row) == len(header) for row in records)
+        kinds = [row[0] for row in records]
+        assert kinds.index("Summary") < kinds.index("Issue") < kinds.index("Material")
+        assert any(row[0] == "Issue" and row[-1] == note for row in records)
 
 
 def test_summary_only_quote_displays_verified_basis_and_unresolved_costs(tmp_path, monkeypatch):

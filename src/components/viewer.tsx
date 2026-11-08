@@ -283,7 +283,7 @@ function SourceSearch({ doc, initial, jump }: { doc: string; initial?: string; j
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   return <div className="source-search">
-    <form className="inline" onSubmit={async (event) => {
+    <form onSubmit={async (event) => {
       event.preventDefault();
       setBusy(true); setError(""); setResult(undefined);
       try {
@@ -292,7 +292,7 @@ function SourceSearch({ doc, initial, jump }: { doc: string; initial?: string; j
       } catch (error) { setError((error as Error).message); }
       finally { setBusy(false); }
     }}>
-      <label className="grow">Find in document<input type="search" value={query} maxLength={120}
+      <label>Find in document<input type="search" value={query} maxLength={120}
         autoFocus disabled={busy} onChange={(event) => setQuery(event.target.value)} /></label>
       <PendingButton className="button secondary" type="submit" disabled={!query.trim()} pending={busy}
         pendingLabel="Searching…">Search</PendingButton>

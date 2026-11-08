@@ -165,19 +165,23 @@ function ReviewForm({ batch, issue, update, hasNext }: {
       setError((error as Error).message);
     } finally { setBusy(false); }
   }}>
-    <label>Review status<select aria-label="Review status" value={status} onChange={(event) => setStatus(event.target.value as ReviewStatus)}>
-      {Object.entries(reviews).map(([key, label]) => <option key={key} value={key}
-        disabled={key === "confirmed" && !issue.confirmable}>{label}</option>)}
-    </select></label>
-    <label className="grow review-note">Internal note
-      <textarea aria-label="Internal note" aria-describedby={noteCount} placeholder="Optional review note"
-        rows={3} value={note} maxLength={noteLimit} onChange={(event) => setNote(event.target.value)} />
-      <small id={noteCount}>{note.length} / {noteLimit} characters</small>
-    </label>
-    <PendingButton className="button secondary" type="submit" disabled={busy} pending={busy && !advance} pendingLabel="Saving review…"
-      icon={<Check size={15} />}>Save review</PendingButton>
+    <div className="review-fields">
+      <label>Review status<select aria-label="Review status" value={status} onChange={(event) => setStatus(event.target.value as ReviewStatus)}>
+        {Object.entries(reviews).map(([key, label]) => <option key={key} value={key}
+          disabled={key === "confirmed" && !issue.confirmable}>{label}</option>)}
+      </select></label>
+      <label className="review-note">Internal note
+        <textarea aria-label="Internal note" aria-describedby={noteCount} placeholder="Optional review note"
+          rows={3} value={note} maxLength={noteLimit} onChange={(event) => setNote(event.target.value)} />
+        <small id={noteCount}>{note.length} / {noteLimit} characters</small>
+      </label>
+    </div>
     {error && <p className="error" role="alert">{error}</p>}
-    {hasNext && <PendingButton className="button primary" type="submit" value="next" disabled={busy}
-      pending={busy && advance} pendingLabel="Saving review…">Save and next</PendingButton>}
+    <div className="inline review-actions">
+      <PendingButton className="button secondary" type="submit" disabled={busy} pending={busy && !advance} pendingLabel="Saving review…"
+        icon={<Check size={15} />}>Save review</PendingButton>
+      {hasNext && <PendingButton className="button primary" type="submit" value="next" disabled={busy}
+        pending={busy && advance} pendingLabel="Saving review…">Save and next</PendingButton>}
+    </div>
   </form>;
 }
