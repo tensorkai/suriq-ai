@@ -41,7 +41,7 @@ Open [the local workspace](http://127.0.0.1:3000). For the production build, kee
 ## Review a batch
 
 1. Create a project and procurement batch.
-2. Choose or drop the BOM and supplier offers together. SuriQ accepts PDF, XLSX, and DOCX. Review the detected role and its source evidence. Use **Correct type** for an exception. For a mixed packet, exclude reference rows before using the rest as an offer.
+2. Choose or drop the BOM and supplier offers together. SuriQ accepts PDF, XLSX, and DOCX. Use **Change document type** in **Manage file** if a role is wrong. For a quotation bundle, download the separate offers, remove the bundle, and upload the individual PDFs.
 3. Inspect flagged **Material lines**, **Document terms**, and **Original source** entries. To confirm a PDF reading, draw a box and transcribe its source text. For XLSX or DOCX, select the original cell or paragraph. Document the reason when excluding a row or supplying a packaging conversion.
 4. Use **Set scope** on the BOM to select all or specific rows. Coverage defaults to unknown for supplier offers.
 5. Run verification. Review the grouped source cards in **Findings** and save a decision. Use **Focus highlights** to center the relevant regions across the linked documents.
@@ -74,7 +74,7 @@ set +a
 SURIQ_AI_PROVIDER=gemini .venv/bin/python -m uvicorn service.api:app --factory --host 127.0.0.1 --port 8765
 ```
 
-Select **Allow assisted reading** for non-confidential uploads or **Try assisted reading** when retrying a document. Gemini receives selected text and PDF page images over HTTPS. Native extraction, original files, source validation, and verification stay local. Google may use free-tier submissions to improve its products. Use Ollama for confidential procurement documents. [Gemini terms](https://ai.google.dev/gemini-api/terms) · [Free-tier pricing](https://ai.google.dev/gemini-api/docs/pricing.md)
+Gemini reads uploads and retries automatically when configured. It receives document excerpts and PDF page images over HTTPS. SuriQ stores originals and validates source evidence locally. Google may use free-tier submissions to improve its products. Set `SURIQ_AI_PROVIDER=off` or use Ollama for a workspace that handles confidential files. [Gemini terms](https://ai.google.dev/gemini-api/terms) · [Free-tier pricing](https://ai.google.dev/gemini-api/docs/pricing.md)
 
 To check the live Gemini connection with a generated sample, load `.env` as above and run `SURIQ_AI_PROVIDER=gemini .venv/bin/python -m tests.live_model`.
 
@@ -110,7 +110,7 @@ SuriQ uses the installed model for scan-heavy, ambiguous, or unfamiliar sources.
 | `SURIQ_OCR_CONFIDENCE` | `75` | OCR word score below which evidence needs review |
 | `SURIQ_MONEY_DECIMALS` | `2` | Decimal half-up rounding precision |
 | `SURIQ_SOFFICE` | `soffice` | LibreOffice executable for DOCX previews |
-| `SURIQ_AI_PROVIDER` | `off` | Choose `gemini`, `ollama`, or `off`. If unset, `SURIQ_ENABLE_OLLAMA=1` selects Ollama |
+| `SURIQ_AI_PROVIDER` | `off` | Choose `gemini`, `ollama`, or `off`. If unset, SuriQ selects enabled Ollama, then configured Gemini, then off |
 | `GEMINI_API_KEY` | unset | Server-side Gemini API key, loaded from `.env` at launch. Also accepts the existing `.suriq/gemini-api-key` file |
 | `SURIQ_GEMINI_TIMEOUT` | `30` | Timeout per Gemini attempt in seconds |
 | `SURIQ_AI_MAX_CALLS` | `12` | Maximum interpretation windows per file |

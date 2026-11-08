@@ -11,11 +11,10 @@ class Candidates(BaseModel):
     ids: list[str] = Field(max_length=3)
 
 
-def suggest(line, candidates, *, use_gemini=False):
-    backend = inference.backend(use_gemini)
+def suggest(line, candidates):
+    backend = inference.backend()
     if backend is None:
-        message = "Confirm sharing with Gemini to request suggestions." if inference.provider() == "gemini" else "AI assistance is disabled."
-        return [], message
+        return [], "Matching suggestions are unavailable. Select a material manually."
     known = {candidate["id"]: identity(candidate)[:240] for candidate in candidates}
     if not known:
         return [], "No anchored BOM rows are available."

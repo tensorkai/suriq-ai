@@ -52,7 +52,7 @@ def response_schema(value):
     return value
 
 
-def chat(model, schema, instructions, payload, *, images=(), tokens=2048, retries=0):
+def chat(model, schema, instructions, payload, *, images=(), tokens=2048, retries=0, temperature=0):
     if model != MODEL:
         raise InferenceError("Gemini is configured for Flash-Lite 3.1.")
     parts = [{"text": json.dumps(payload, ensure_ascii=False)}]
@@ -64,7 +64,7 @@ def chat(model, schema, instructions, payload, *, images=(), tokens=2048, retrie
             "responseMimeType": "application/json",
             "responseJsonSchema": response_schema(schema.model_json_schema()),
             "maxOutputTokens": tokens,
-            "temperature": 0,
+            "temperature": temperature,
             "thinkingConfig": {"thinkingLevel": "MINIMAL"},
         },
     }).encode(), headers={"Content-Type": "application/json", "x-goog-api-key": require_key()})

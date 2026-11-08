@@ -41,8 +41,7 @@ def main():
             batch = create(client)
             route = f"/batches/{batch}/documents"
             ok(client.post(route, files={"file": ("requirements.xlsx", xlsx([BOM]))}))
-            data = {"use_gemini": "true"} if use_gemini else {}
-            key = ok(client.post(route, files={"file": ("unfamiliar.pdf", output.getvalue())}, data=data))["id"]
+            key = ok(client.post(route, files={"file": ("unfamiliar.pdf", output.getvalue())}))["id"]
             data = ok(client.get(f"/batches/{batch}"))
             doc = next(doc for doc in data["documents"] if doc["id"] == key)
             print(f"Live intake in {monotonic() - start:.1f}s. Role={doc['role']} status={doc['status']}")

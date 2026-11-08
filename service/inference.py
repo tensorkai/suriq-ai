@@ -1,11 +1,11 @@
-"""Select the configured inference provider and enforce hosted opt-in."""
+"""Select the configured inference provider."""
 import os
 
 from service import gemini, ollama
 
 
 def provider():
-    return os.getenv("SURIQ_AI_PROVIDER") or ("ollama" if ollama.enabled() else "off")
+    return os.getenv("SURIQ_AI_PROVIDER") or ("ollama" if ollama.enabled() else "gemini" if gemini.api_key() else "off")
 
 
 def public_status():
@@ -13,9 +13,9 @@ def public_status():
     return {"provider": selected, "configured": bool(gemini.api_key()) if selected == "gemini" else selected == "ollama"}
 
 
-def backend(use_gemini):
+def backend():
     selected = provider()
-    if selected == "gemini" and use_gemini:
+    if selected == "gemini":
         return gemini
     if selected == "ollama":
         return ollama

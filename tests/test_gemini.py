@@ -1,4 +1,4 @@
-"""Hosted provider contract and the per-action sharing boundary."""
+"""Hosted provider contract and source grounding."""
 import json
 from io import BytesIO
 from urllib.error import HTTPError
@@ -11,7 +11,7 @@ from service.api import create_app
 from tests.test_acceptance import create, ok
 
 
-def test_gemini_requires_upload_opt_in_and_preserves_pdf_anchors(tmp_path, monkeypatch):
+def test_gemini_reads_uploads_and_retries_without_permission(tmp_path, monkeypatch):
     monkeypatch.setenv("SURIQ_AI_PROVIDER", "gemini")
     monkeypatch.setenv("GEMINI_API_KEY", "synthetic-test-key")
     requests = []
@@ -22,6 +22,7 @@ def test_gemini_requires_upload_opt_in_and_preserves_pdf_anchors(tmp_path, monke
         assert request.get_header("X-goog-api-key") == "synthetic-test-key"
         body = json.loads(request.data)
         assert body["generationConfig"]["responseMimeType"] == "application/json"
+        assert body["generationConfig"]["temperature"] == 0.2
         assert body["generationConfig"]["responseJsonSchema"]["type"] == "object"
         parts = body["contents"][0]["parts"]
         assert parts[1]["inlineData"]["mimeType"] == "image/png"
@@ -29,7 +30,9 @@ def test_gemini_requires_upload_opt_in_and_preserves_pdf_anchors(tmp_path, monke
         row = next(element["id"] for element in elements if "Anchor bolts" in element["text"])
         heading = next(element["id"] for element in elements if "Quotation" in element["text"])
         response = {"role": "quote", "rationale": "Offer heading", "evidence": [heading],
-                    "rows": [{"origin": row, "fields": [
+                    "rows": [{"origin": "unknown-cell", "fields": [
+                        {"field": "material", "element": "unknown-cell", "value": "Imaginary cable"},
+                    ]}, {"origin": row, "fields": [
                         {"field": "material", "element": row, "value": "Anchor bolts"},
                         {"field": "quantity", "element": row, "value": "50"},
                         {"field": "unit", "element": row, "value": "pcs"},
@@ -49,12 +52,13 @@ def test_gemini_requires_upload_opt_in_and_preserves_pdf_anchors(tmp_path, monke
         key = ok(client.post(route, files={"file": ("unfamiliar.pdf", output.getvalue())}))["id"]
         view = ok(client.get(f"/batches/{batch}"))
         assert view["ai"] == {"provider": "gemini", "configured": True}
-        assert not requests and view["documents"][0]["role"] == "unknown"
-        ok(client.post(f"/documents/{key}/retry", data={"use_gemini": "true"}))
+        assert len(requests) == 1 and view["documents"][0]["role"] == "quote"
+        ok(client.post(f"/documents/{key}/retry"))
         view = ok(client.get(f"/batches/{batch}"))
         doc, = view["documents"]
-        assert len(requests) == 1 and doc["role"] == "quote"
+        assert len(requests) == 2 and doc["role"] == "quote"
         assert doc["provenance"]["provider"] == "gemini"
+        assert doc["provenance"]["discarded_citations"] == 1 and len(doc["lines"]) == 1
         quantity = doc["lines"][0]["anchors"]["quantity"]
         assert quantity["text"] == "50" and quantity["boxes"] and quantity["weak"]
         assert "synthetic-test-key" not in json.dumps(view)
@@ -96,3 +100,36 @@ def test_gemini_omits_remote_bounds_but_enforces_them_locally(monkeypatch):
     monkeypatch.setattr(gemini, "send", send)
     with pytest.raises(InferenceError, match="invalid or incomplete structured output"):
         gemini.chat(gemini.model_name(), Interpretation, "Interpret this source.", {})
+
+
+def test_quotation_bundle_keeps_each_supplier_pdf_separate(tmp_path, monkeypatch):
+    monkeypatch.setenv("SURIQ_AI_PROVIDER", "off")
+    output = BytesIO()
+    page = Canvas(output)
+    for supplier, total in (("Northside Electric", "1,000.00"), ("Southside Electric", "2,000.00")):
+        page.drawString(40, 790, supplier)
+        page.drawRightString(540, 790, "QUOTATION")
+        page.drawString(40, 740, "TOTAL CONTRACT PRICE")
+        page.drawRightString(540, 740, f"PHP {total}")
+        page.showPage()
+    page.save()
+    with TestClient(create_app(tmp_path / "workspace.sqlite")) as client:
+        batch = create(client)
+        key = ok(client.post(f"/batches/{batch}/documents", files={"file": ("bundle.pdf", output.getvalue())}))["id"]
+        view = ok(client.get(f"/batches/{batch}"))
+        doc, = view["documents"]
+        assert doc["role"] == "mixed"
+        assert doc["classification"]["bundled_offers"] == [
+            {"supplier": "Northside Electric", "pages": [1]},
+            {"supplier": "Southside Electric", "pages": [2]},
+        ]
+        assert client.patch(f"/documents/{key}/role", data={
+            "role": "quote", "supplier": "Northside Electric", "reason": "Attempt to merge offers",
+        }).status_code == 422
+        offer = client.get(f"/documents/{key}/offer/2")
+        assert offer.is_success and offer.content.startswith(b"%PDF")
+        separate = ok(client.post(f"/batches/{batch}/documents", files={"file": ("southside.pdf", offer.content)}))["id"]
+        view = ok(client.get(f"/batches/{batch}"))
+        quote = next(doc for doc in view["documents"] if doc["id"] == separate)
+        assert quote["supplier"] == "Southside Electric" and quote["summary_only"]
+        assert quote["terms"]["total"] == "PHP 2,000.00"

@@ -1,7 +1,8 @@
 export type Coverage = "full" | "partial" | "unknown";
+export const coverageLabel: Record<Coverage, string> = { full: "Full scope", partial: "Partial offer", unknown: "Coverage unknown" };
 export type Scope = "all" | "selected" | "unknown";
 export type Box = [number, number, number, number];
-export type Anchor = { source: number | string; boxes?: Box[]; cells?: string[]; text: string; weak?: boolean };
+export type Anchor = { source: number | string; boxes?: Box[]; cells?: string[]; text: string; weak?: boolean; scope?: "page" | "document" };
 export type Source = {
   ref: number | string;
   method: "text" | "ocr" | "cells";
@@ -20,16 +21,18 @@ export type Line = {
 export type Document = {
   id: string; name: string; kind: "pdf" | "xlsx" | "docx"; role: "bom" | "quote" | "unknown" | "mixed" | "unsupported";
   summary_only?: boolean; parser_update_available?: boolean;
-  classification?: { role: string; basis: string; evidence: Anchor[] };
+  classification?: { role: string; basis: string; evidence: Anchor[]; bundled_offers?: { supplier: string; pages: number[] }[] };
   provenance?: { parser: string; provider?: string; model?: string; model_digest?: string; inference: string };
   intake: string; supplier: string; processing_step: string; revises: string | null; superseded_by: string | null;
   status: "ready" | "processing" | "needs_review" | "failed"; coverage: Coverage; error: string;
   lines: Line[]; sources: Source[]; terms: Record<string, string>; term_anchors: Record<string, Anchor>;
 };
 export type ReviewStatus = "open" | "confirmed" | "false_positive" | "clarification";
+export type SourceEditor = { document: string; target: string; field: string; source?: number | string };
 export type Issue = {
   id: string; rule: string; fingerprint: string; title: string; note: string;
   severity: "Blocking" | "Warning" | "Info"; evidence: (Anchor & { document: string })[];
+  search_hint?: string; source_editors?: SourceEditor[];
   review_required: boolean; confirmable: boolean; review: { status: ReviewStatus; note: string };
 };
 export type Comparison = {
@@ -44,7 +47,9 @@ export type AIStatus = { provider: string; configured: boolean };
 export type Batch = {
   ai: AIStatus;
   id: string; name: string; project: string; project_name: string; verified_at: string | null; stale: number;
-  verification_problem: string; scope_mode: Scope; scope: string[]; documents: Document[]; issues: Issue[]; comparison: Comparison[];
+  verification_problem: string;
+  verification_action: { kind: "upload" } | { kind: "type" | "scope" | "retry" | "manage" | "read"; document: string } | null;
+  scope_mode: Scope; scope: string[]; documents: Document[]; issues: Issue[]; comparison: Comparison[];
   matches: Record<string, { bom: string | null; candidates: string[]; method: string }>;
   history: AuditEvent[];
 };
@@ -77,12 +82,21 @@ export function procurementRows(lines: Line[]) {
   return lines.filter((line) => !line.excluded && line.kind !== "service");
 }
 
+export function supplierNameNeeded(supplier: string) {
+  return !supplier.trim() || /^unidentified supplier(?: [0-9a-f]{6})?$/i.test(supplier);
+}
+
 export function docName(doc: Document) {
   if (doc.role === "bom") return "Bill of materials";
-  if (doc.role === "quote") return doc.supplier;
+  if (doc.role === "quote") return supplierNameNeeded(doc.supplier) ? "Supplier name needed" : doc.supplier;
+  if (doc.classification?.bundled_offers?.length) return "Supplier quotation bundle";
   if (doc.role === "mixed") return "Mixed document";
   if (doc.role === "unsupported") return "Unsupported document";
   return doc.status === "processing" ? "Identifying document" : "Type needs review";
+}
+
+export function hasPreciseSource(anchor: Anchor) {
+  return Boolean(anchor.boxes?.length || anchor.cells?.length);
 }
 
 export function sourceName(source: number | string) {

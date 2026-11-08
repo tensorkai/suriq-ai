@@ -1,11 +1,18 @@
 """Local report exports from the verified batch snapshot."""
 import csv
+import re
 from io import BytesIO, StringIO
 from xml.sax.saxutils import escape
 
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+
+
+def supplier_label(name, filename):
+    if not name or re.fullmatch(r"unidentified supplier(?: [0-9a-f]{6})?", name, re.I):
+        return f"Supplier name needed ({filename})"
+    return name
 
 
 def source_label(source):
@@ -23,7 +30,8 @@ def report_rows(batch):
     yield ("Basis", "Verification is for human review before purchase approval.")
     for doc in batch["documents"]:
         status = "Superseded" if doc["superseded_by"] else doc["status"]
-        yield ("Document", doc["name"], doc["role"], doc["supplier"], doc["digest"], status)
+        supplier = supplier_label(doc["supplier"], doc["name"]) if doc["role"] == "quote" else doc["supplier"]
+        yield ("Document", doc["name"], doc["role"], supplier, doc["digest"], status)
         if doc["revises"]:
             yield ("Revision", doc["name"], docs.get(doc["revises"], "Previous revision"))
         for line in doc["lines"]:
@@ -43,14 +51,15 @@ def report_rows(batch):
             yield ("Correction", docs.get(data["document"], ""), data.get("target", ""), entry["created"],
                    changes, data.get("note") or data.get("reason", ""))
     for supplier in batch["comparison"]:
-        yield ("Supplier", supplier["supplier"], supplier["coverage"], supplier["tax_basis"],
+        name = supplier_label(supplier["supplier"], docs.get(supplier["document"], "quotation"))
+        yield ("Supplier", name, supplier["coverage"], supplier["tax_basis"],
                f"{supplier['currency']} {supplier['total']}" if supplier["total"] is not None else "Incomparable",
                "; ".join(supplier["reasons"]))
-        for name, value in supplier["terms"].items():
-            yield ("Term", supplier["supplier"], name, value)
+        for term, value in supplier["terms"].items():
+            yield ("Term", name, term, value)
         for key, item in supplier["items"].items():
             for offer in item["offers"] or [{}]:
-                yield ("Material", supplier["supplier"], key, item["state"],
+                yield ("Material", name, key, item["state"],
                        offer.get("material", offer.get("description", "")),
                        " ".join(offer.get(field, "") for field in ("quantity", "unit")).strip(),
                        " · ".join(offer[field] for field in ("unit_price", "amount") if offer.get(field)))

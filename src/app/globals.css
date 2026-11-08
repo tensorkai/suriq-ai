@@ -161,6 +161,8 @@ svg { flex-shrink: 0; }
 .paper-scroll { background: #dfe7df; padding: 7px; max-height: 620px; overflow: auto; }
 .pdf-page { position: relative; min-width: 75%; margin-inline: auto; background: #fff; }
 .pdf-page img { display: block; width: 100%; height: auto; }
+.pdf-page.pannable { cursor: grab; user-select: none; }
+.pdf-page.pannable:active { cursor: grabbing; }
 .pdf-page.marking { cursor: crosshair; touch-action: none; }
 .pdf-page.marking .evidence-box { pointer-events: none; }
 .evidence-box { position: absolute; border: 1px solid #9c6315; background: #ffc24b68; }
@@ -168,8 +170,10 @@ svg { flex-shrink: 0; }
 .evidence-text { display: grid; gap: 4px; list-style: none; padding: 7px; margin: 0; max-height: 110px; overflow: auto; font-size: 11px; color: #684619; }
 .evidence-text li { display: flex; align-items: start; gap: 5px; overflow-wrap: anywhere; }
 .zoom { display: flex; align-items: center; flex-shrink: 0; padding: 1px 3px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
-.zoom .icon-button { width: 26px; height: 27px; }
-.zoom-reset { padding: 4px; font: 700 11px var(--mono); }
+.zoom .icon-button { width: 32px; height: 30px; }
+.zoom-level { min-width: 41px; padding: 0 4px; text-align: center; font: 700 11px var(--mono); }
+.zoom .zoom-fit { border-left: 1px solid var(--line); border-radius: 0 5px 5px 0; }
+.paper-scroll:focus-visible { outline-offset: -3px; }
 .sheet-scroll { max-height: 550px; }
 .sheet { min-width: 100%; border-collapse: collapse; font: .8em/1.4 var(--mono); }
 .sheet td, .sheet th { padding: 5px 7px; border: 1px solid #dfe7dc; min-width: 46px; }
@@ -177,7 +181,12 @@ svg { flex-shrink: 0; }
 .sheet td { white-space: pre-wrap; min-width: 60px; max-width: 270px; overflow-wrap: anywhere; }
 .sheet td.marked-cell { background: #ffe7a7; outline: 1px solid #bc8b32; outline-offset: -1px; }
 .sheet td button { text-align: left; width: 100%; }
-.source-controls { display: flex; justify-content: end; margin-bottom: 7px; }
+.preview-tools { display: flex; justify-content: end; align-items: center; flex-wrap: wrap; gap: 4px; padding: 4px 7px; }
+.preview-tools .pan-toggle, .pan-hint { margin-right: auto; font-size: 11px; }
+.preview-tools .pan-toggle { min-height: 32px; padding: 4px 8px; }
+.preview-tools .pan-toggle[aria-pressed="true"] { background: var(--mint); }
+.pan-hint { color: var(--muted); }
+@media (pointer: coarse) { .pan-hint { display: none; } }
 .source-single { max-width: 850px; }
 .terms-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 1px; margin: 0; background: var(--line); border: 1px solid var(--line); }
 .terms-grid > div { padding: 10px; background: #fff; overflow-wrap: anywhere; }
@@ -262,3 +271,23 @@ svg { flex-shrink: 0; }
 .activity-values > div { display: flex; flex-wrap: wrap; gap: 6px; }
 .activity-values dt { font-weight: 650; }
 .activity-values dd { margin: 0; overflow-wrap: anywhere; }
+
+.comparison-controls { justify-content: space-between; margin-bottom: 12px; }
+.comparison-reasons { margin-top: 6px; }
+.comparison-findings { margin: 0; }
+.comparison-findings small { display: block; }
+.text-button { padding: 0; border: 0; background: transparent; text-align: left; color: var(--green); text-decoration: underline; cursor: pointer; }
+.source-reference { display: flex; align-items: flex-start; gap: 10px; padding: 10px; border-top: 1px solid var(--line); }
+.source-reference > div { min-width: 0; }
+.source-reference p { margin: 4px 0; }
+.source-thumbnail { width: 48px; height: auto; border: 1px solid var(--line); border-radius: 3px; }
+.source-actions { margin-top: 6px; }
+.source-actions .button { min-height: 28px; font-size: 12px; padding: 3px 7px; }
+.source-search { padding: 8px 10px; border-top: 1px solid var(--line); }
+.source-search form { align-items: flex-end; }
+.source-search h4 { margin: 8px 0 4px; }
+.source-search ul { list-style: none; padding: 0; margin: 0; max-height: 180px; overflow: auto; }
+.source-excerpt { display: block; width: 100%; background: transparent; border: 0; padding: 5px; text-align: left; color: inherit; overflow-wrap: anywhere; cursor: pointer; }
+.source-excerpt strong { margin-right: 4px; color: var(--green); text-decoration: underline; }
+.source-excerpt:hover { background: var(--mint); }
+.source-excerpt mark { background: #fff0bd; color: var(--ink); }

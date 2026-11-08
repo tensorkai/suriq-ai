@@ -18,7 +18,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from service.inference import provider, public_status
 from service.extraction import (
-    LINE_FIELDS, PARSER_VERSION, TERM_FIELDS, ExtractionError, extract, render_docx, render_page, validate_file,
+    LINE_FIELDS, PARSER_VERSION, TERM_FIELDS, ExtractionError, extract, render_docx, render_page, run_command, validate_file,
 )
 from service.reports import report
 from service.store import Store, apply_overlay, attach_reviews, documents, event, now
@@ -63,6 +63,10 @@ class Correction(Input):
     excluded: bool | None = None
 
 
+class SourceSearch(Input):
+    query: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)]
+
+
 class QuoteCoverage(Input):
     coverage: Coverage
 
@@ -93,18 +97,21 @@ def load_batch(db, batch):
     data["ai"] = public_status()
     data["documents"] = documents(db, batch)
     for doc in data["documents"]:
+        doc.pop("ocr_search", None)
         doc["summary_only"] = summary_quote(doc)
         doc["parser_update_available"] = (
             doc["kind"] == "pdf" and doc["status"] == "ready"
             and doc.get("provenance", {}).get("parser") != PARSER_VERSION
             and not db.execute("SELECT 1 FROM overlays WHERE document = ?", (doc["id"],)).fetchone()
         )
-    data["verification_problem"] = verification_problem(active_documents(data["documents"]),
-                                                       data["scope_mode"], data["scope"])
+    data["verification_problem"], data["verification_action"] = verification_problem(
+        active_documents(data["documents"]), data["scope_mode"], data["scope"]
+    )
     data.update(json.loads(stored) if stored and not data["stale"] else {
         "issues": [], "comparison": [], "matches": {},
     })
     attach_reviews(db, batch, data["issues"])
+    add_review_context(data["issues"], data["documents"], data["matches"])
     data["history"] = [
         {**dict(row), "data": json.loads(row["data"])} for row in db.execute("""
             SELECT id, action, actor, created, data FROM audit WHERE batch = ? ORDER BY id DESC LIMIT 150
@@ -122,27 +129,77 @@ def active_documents(docs):
 def verification_problem(docs, scope_mode, scope):
     boms = [doc for doc in docs if doc["role"] == "bom"]
     quotes = [doc for doc in docs if doc["role"] == "quote"]
-    if any(doc["status"] not in {"ready", "needs_review"} for doc in docs):
-        return "Wait for processing or retry failed files."
+    if any(doc["status"] == "processing" for doc in docs):
+        return "Wait for the remaining documents to finish reading.", None
+    if failed := next((doc for doc in docs if doc["status"] == "failed"), None):
+        return "A file could not be read. Try reading it again.", {"kind": "retry", "document": failed["id"]}
+    if unsupported := next((doc for doc in docs if doc["role"] == "unsupported"), None):
+        return "Remove unsupported procurement documents from this batch.", {"kind": "manage", "document": unsupported["id"]}
+    if bundle := next((doc for doc in docs if doc.get("classification", {}).get("bundled_offers")), None):
+        return "Download the separate supplier offers, remove the bundle, and upload the individual PDFs.", {
+            "kind": "read", "document": bundle["id"],
+        }
+    if revision := next((doc for doc in docs if doc["revises"] and doc["role"] != "quote"), None):
+        return "A revised offer must be classified as a quotation.", {"kind": "type", "document": revision["id"]}
+    if unclear := next((doc for doc in docs if doc["role"] not in {"bom", "quote"}), None):
+        return "Confirm unknown or mixed document types before verification.", {"kind": "type", "document": unclear["id"]}
     if len(boms) > 1:
-        return "Multiple BOMs detected. Use one baseline BOM per batch and keep different project sites in separate batches."
-    if any(doc["role"] == "unsupported" for doc in docs):
-        return "Remove unsupported procurement documents from this batch."
-    if any(doc["revises"] and doc["role"] != "quote" for doc in docs):
-        return "A revised offer must be classified as a quotation. Correct the type or remove the revision."
-    if any(doc["role"] not in {"bom", "quote"} for doc in docs):
-        return "Resolve unknown or mixed document types before verification."
-    if len(boms) != 1 or not 1 <= len(quotes) <= 5:
-        return "Verification requires one BOM and one to five quotations."
-    if not boms[0]["lines"] or any(not doc["lines"] and not summary_quote(doc)
-                                  for doc in quotes if doc["intake"] != "legacy"):
-        return "The BOM needs material rows. Each quote needs itemized rows or a priced summary."
+        return ("Multiple BOMs detected. Use one baseline BOM per batch and keep different project sites in separate batches.",
+                {"kind": "manage", "document": boms[1]["id"]})
+    if len(boms) != 1 or not quotes:
+        return "Verification requires one BOM and one to five quotations.", {"kind": "upload"}
+    if len(quotes) > 5:
+        return "Verification requires at most five quotations.", {"kind": "manage", "document": quotes[5]["id"]}
+    if empty := next((doc for doc in [*boms, *quotes] if not doc["lines"]
+                      and (doc["role"] == "bom" or (doc["intake"] != "legacy" and not summary_quote(doc)))), None):
+        return ("The BOM needs material rows. Each quote needs itemized rows or a priced summary.",
+                {"kind": "read", "document": empty["id"]})
     baseline = {line["id"] for line in boms[0]["lines"]}
     if scope_mode == "unknown" or (scope_mode == "selected" and (not scope or set(scope) - baseline)):
-        return "Set the purchase scope using the current BOM rows."
+        return "Set the purchase scope using the current BOM rows.", {"kind": "scope", "document": boms[0]["id"]}
     if not one_schedule(boms[0]["lines"], scope_mode, scope):
-        return "Select material rows from one supplier schedule and project site."
-    return ""
+        return "Select material rows from one supplier schedule and project site.", {"kind": "scope", "document": boms[0]["id"]}
+    return "", None
+
+
+def add_review_context(issues, docs, matches):
+    # Derive viewer metadata on read so saved reviews retain their evidence fingerprints.
+    if not issues:
+        return
+    baseline = {line["id"]: line["fields"] for doc in docs if doc["role"] == "bom" for line in doc["lines"]}
+    fields = {(doc["id"], line["id"]): line["fields"] for doc in docs for line in doc["lines"]}
+    quotes = {doc["id"] for doc in docs if doc["role"] == "quote"}
+    for issue in issues:
+        rule, subject, condition = issue["rule"], issue["subject"], issue["condition"]
+        for anchor in issue["evidence"]:
+            if not (anchor.get("boxes") or anchor.get("cells")):
+                is_page_warning = rule == "extraction" and condition == anchor["source"]
+                anchor["scope"] = "page" if is_page_warning else "document"
+        if rule == "missing" and isinstance(subject, str) and subject in baseline:
+            row = baseline[subject]
+            issue["search_hint"] = row.get("code") or row.get("material") or row.get("description", "")
+        if rule == "charges" and isinstance(subject, list) and condition in {"freight", "charges", "discount"}:
+            issue["source_editors"] = [{"document": subject[0], "target": "terms", "field": condition}]
+        if rule == "tax" and condition in {"unknown", "VAT exclusive"}:
+            issue["source_editors"] = [{"document": subject, "target": "terms",
+                                        "field": "tax" if condition == "unknown" else "vat"}]
+        if rule == "delivery" and issue["review_required"]:
+            offer_ids = {anchor["document"] for anchor in issue["evidence"]} & quotes
+            if subject == "batch":
+                editors = [{"document": key, "target": "terms", "field": "delivery"} for key in sorted(offer_ids)]
+            else:
+                row = baseline.get(subject, {})
+                field = "delivery_date" if row.get("delivery_date") == condition[0] else "lead_time"
+                editors = [{"document": key, "target": line, "field": field}
+                           for key, line in fields if key in offer_ids and matches.get(f"{key}:{line}", {}).get("bom") == subject]
+            if editors:
+                issue["source_editors"] = editors
+        if rule == "extraction" and condition == "quantity or unit":
+            line = fields.get(tuple(subject), {})
+            field = "quantity" if decimal_value(line.get("quantity", "")) is None else "unit"
+            issue["source_editors"] = [{"document": subject[0], "target": subject[1], "field": field}]
+        if rule == "extraction" and condition == "no rows":
+            issue["source_editors"] = [{"document": subject, "target": "new", "field": "material"}]
 
 
 def rerun(db, batch, *, explicit=False):
@@ -150,7 +207,7 @@ def rerun(db, batch, *, explicit=False):
     if not explicit and not batch_row["verified_at"]:
         return
     docs = active_documents(documents(db, batch))
-    problem = verification_problem(docs, batch_row["scope_mode"], json.loads(batch_row["scope"]))
+    problem, _ = verification_problem(docs, batch_row["scope_mode"], json.loads(batch_row["scope"]))
     if problem:
         if explicit:
             fail(409, problem)
@@ -222,11 +279,11 @@ def create_app(path):
         response.headers["X-Content-Type-Options"] = "nosniff"
         return response
 
-    def process(doc_id, use_gemini):
+    def process(doc_id):
         with extraction_slots:
-            process_source(doc_id, use_gemini)
+            process_source(doc_id)
 
-    def process_source(doc_id, use_gemini):
+    def process_source(doc_id):
         with store.connection() as db:
             doc = db.execute("SELECT original, kind, batch, role, intake, supplier FROM documents WHERE id = ?", (doc_id,)).fetchone()
         if doc is None:
@@ -237,7 +294,7 @@ def create_app(path):
                     step = "Gemini interpretation" if provider() == "gemini" else "Local AI interpretation"
                     db.execute("UPDATE documents SET processing_step = ? WHERE id = ?", (step, doc_id))
 
-            snapshot = extract(doc["original"], doc["kind"], on_inference=interpreting, use_gemini=use_gemini)
+            snapshot = extract(doc["original"], doc["kind"], on_inference=interpreting)
             classification = snapshot["classification"]
             error = snapshot["provenance"].get("message", "")
             if not snapshot["lines"] and not classification.get("summary_only"):
@@ -359,8 +416,7 @@ def create_app(path):
     def upload(batch: str, tasks: BackgroundTasks, file: Annotated[UploadFile, File()],
                role: Annotated[Role | None, Form()] = None, supplier: Annotated[str, Form(max_length=120)] = "",
                coverage: Annotated[Coverage, Form()] = "unknown",
-               revises: Annotated[str, Form(max_length=32)] = "",
-               use_gemini: Annotated[bool, Form()] = False):
+               revises: Annotated[str, Form(max_length=32)] = ""):
         supplier = supplier.strip()
         if role == "quote" and not supplier:
             fail(422, "Assign a supplier to the quotation.")
@@ -409,8 +465,8 @@ def create_app(path):
             db.execute("UPDATE batches SET stale = 1 WHERE id = ? AND verified_at IS NOT NULL", (batch,))
             event(db, batch, "import_document", {"document": key, "name": name, "sha256": digest,
                                                   "role": role, "supplier": supplier, "coverage": coverage,
-                                                  "revises": revises or None, "use_gemini": use_gemini})
-        tasks.add_task(process, key, use_gemini)
+                                                  "revises": revises or None})
+        tasks.add_task(process, key)
         return {"id": key}
 
     @app.patch("/documents/{key}/role")
@@ -421,6 +477,9 @@ def create_app(path):
             doc = get_row(db, "documents", key, "role, status, batch, supplier, revises")
             if not reason.strip():
                 fail(422, "Explain why the document type is being corrected.")
+            current = next(row for row in documents(db, doc["batch"]) if row["id"] == key)
+            if current.get("classification", {}).get("bundled_offers"):
+                fail(422, "Download the separate offers before assigning a quotation type.")
             if doc["role"] == "unsupported":
                 fail(422, "Remove unsupported procurement documents from the batch.")
             if doc["revises"] and role != "quote":
@@ -432,7 +491,6 @@ def create_app(path):
             if role == "quote" and not supplier.strip():
                 fail(422, "Enter the supplier name for this quotation.")
             if exclude_rows:
-                current = next(row for row in documents(db, doc["batch"]) if row["id"] == key)
                 if set(exclude_rows) - {line["id"] for line in current["lines"]}:
                     fail(422, "Select material rows from this source.")
                 db.executemany("""INSERT INTO overlays VALUES (?, ?, '{"excluded":true}')
@@ -450,7 +508,7 @@ def create_app(path):
             return load_batch(db, doc["batch"])
 
     @app.post("/documents/{key}/retry", status_code=202)
-    def retry(key: str, tasks: BackgroundTasks, use_gemini: Annotated[bool, Form()] = False):
+    def retry(key: str, tasks: BackgroundTasks):
         with store.connection(write=True) as db:
             doc = get_row(db, "documents", key, "batch, status, kind, snapshot_id")
             if doc["status"] not in {"failed", "needs_review"}:
@@ -462,8 +520,8 @@ def create_app(path):
                 fail(409, "This source has manual corrections. Retain them and use the staging grid.")
             db.execute("UPDATE documents SET status = 'processing', error = '' WHERE id = ?", (key,))
             db.execute("UPDATE batches SET stale = 1 WHERE id = ? AND verified_at IS NOT NULL", (doc["batch"],))
-            event(db, doc["batch"], "retry_extraction", {"document": key, "use_gemini": use_gemini})
-        tasks.add_task(process, key, use_gemini)
+            event(db, doc["batch"], "retry_extraction", {"document": key})
+        tasks.add_task(process, key)
         return {"id": key}
 
     @app.delete("/documents/{key}")
@@ -488,6 +546,39 @@ def create_app(path):
             "Content-Disposition": f"attachment; filename*=UTF-8''{quote(doc['name'], safe='')}",
         })
 
+    @app.get("/documents/{key}/offer/{first_page}")
+    def download_offer(key: str, first_page: int):
+        with store.connection() as db:
+            doc = get_row(db, "documents", key, "original, kind, snapshot_id")
+            stored = db.execute("SELECT content FROM snapshots WHERE id = ?", (doc["snapshot_id"],)).fetchone()
+        if doc["kind"] != "pdf" or not stored:
+            fail(404, "This supplier offer is unavailable.")
+        bundles = json.loads(stored["content"]).get("classification", {}).get("bundled_offers", [])
+        offer = next((item for item in bundles if item["pages"][0] == first_page), None)
+        if not offer:
+            fail(404, "This supplier offer is unavailable.")
+        try:
+            with TemporaryDirectory(prefix="suriq-offer-") as tmp:
+                folder = Path(tmp)
+                path = folder / "original.pdf"
+                path.write_bytes(doc["original"])
+                pages = []
+                for page in offer["pages"]:
+                    run_command(["pdfseparate", "-f", str(page), "-l", str(page), str(path), str(folder / "page-%d.pdf")])
+                    pages.append(folder / f"page-{page}.pdf")
+                if len(pages) == 1:
+                    content = pages[0].read_bytes()
+                else:
+                    combined = folder / "offer.pdf"
+                    run_command(["pdfunite", *map(str, pages), str(combined)])
+                    content = combined.read_bytes()
+        except (ExtractionError, OSError):
+            fail(422, "The supplier pages could not be separated. Download the original to review them.")
+        from urllib.parse import quote
+        name = quote(f"{offer['supplier']} - offer.pdf", safe="")
+        return Response(content, media_type="application/pdf",
+                        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{name}"})
+
     @app.get("/documents/{key}/rendered")
     def rendered_docx(key: str):
         with store.connection() as db:
@@ -501,8 +592,69 @@ def create_app(path):
         return Response(pdf, media_type="application/pdf",
                         headers={"Content-Disposition": "inline; filename=preview.pdf"})
 
+    @app.post("/documents/{key}/search")
+    def search(key: str, data: SourceSearch):
+        with store.connection() as db:
+            doc = get_row(db, "documents", key, "kind, original, snapshot_id")
+            stored = db.execute("SELECT content FROM snapshots WHERE id = ?", (doc["snapshot_id"],)).fetchone()
+        snapshot = json.loads(stored["content"]) if stored else {}
+        sources = snapshot.get("sources", [])
+        if doc["kind"] == "pdf" and sources:
+            try:
+                with TemporaryDirectory(prefix="suriq-search-") as tmp:
+                    path = Path(tmp) / "original.pdf"
+                    path.write_bytes(doc["original"])
+                    output = run_command(["pdftotext", "-layout", "-cropbox", str(path), "-"])
+            except ExtractionError:
+                fail(422, "Search text is unavailable for this PDF. Open the original to review it.")
+            pages = output.decode("utf-8", "replace").split("\f")
+            ocr = snapshot.get("ocr_search", {})
+            legacy_scans = {str(source["ref"]) for source in sources
+                            if source["method"] == "ocr" and str(source["ref"]) not in ocr}
+            excerpts = {}
+            if legacy_scans:
+                anchors = [*snapshot.get("term_anchors", {}).values(),
+                           *(anchor for line in snapshot.get("lines", []) for anchor in line["anchors"].values())]
+                for anchor in anchors:
+                    ref = str(anchor["source"])
+                    if ref in legacy_scans and anchor.get("text"):
+                        excerpts.setdefault(ref, []).append(anchor["text"])
+            rows = []
+            for index, source in enumerate(sources):
+                ref = source["ref"]
+                text = pages[index] if index < len(pages) else ""
+                lines = text.splitlines() if text.strip() else ocr.get(str(ref), excerpts.get(str(ref), []))
+                rows.append((ref, lines))
+            partial = bool(legacy_scans)
+        else:
+            partial = False
+            rows = [(source["ref"], [" | ".join(row["cells"].values()) for row in source.get("rows", [])])
+                    for source in sources]
+        query = re.compile(re.escape(" ".join(data.query.split())), re.IGNORECASE)
+        searchable = sum(any(line.strip() for line in lines) for _, lines in rows)
+        partial |= searchable < len(rows)
+        matches = []
+        for ref, lines in rows:
+            for line in dict.fromkeys(lines):
+                text = " ".join(line.split())
+                match = query.search(text)
+                if match:
+                    start = max(0, match.start() - 80)
+                    excerpt = text[start:match.end() + 100]
+                    matches.append({"source": ref, "text": ("…" if start else "") + excerpt})
+                    if len(matches) == 50:
+                        return {"searchable": True, "partial": partial, "matches": matches, "limited": True}
+        return {"searchable": bool(searchable), "partial": partial, "matches": matches, "limited": False}
+
+    @app.get("/documents/{key}/thumbnail/{number}")
+    def thumbnail(key: str, number: int):
+        return pdf_preview(key, number, scale=180)
+
     @app.get("/documents/{key}/page/{number}")
     def page(key: str, number: int):
+        return pdf_preview(key, number)
+
+    def pdf_preview(key, number, *, scale=None):
         with store.connection() as db:
             doc = get_row(db, "documents", key, "kind, original, snapshot_id")
             stored = db.execute("SELECT content FROM snapshots WHERE id = ?", (doc["snapshot_id"],)).fetchone()
@@ -514,7 +666,7 @@ def create_app(path):
             with TemporaryDirectory(prefix="suriq-render-") as tmp:
                 path = Path(tmp) / "original.pdf"
                 path.write_bytes(doc["original"])
-                png = render_page(path, number, tmp).read_bytes()
+                png = render_page(path, number, tmp, scale=scale).read_bytes()
         except ExtractionError as exc:
             fail(422, str(exc))
         return Response(png, media_type="image/png")
@@ -621,7 +773,7 @@ def create_app(path):
         return correction(key, "@terms", data)
 
     @app.post("/documents/{key}/line/{target}/suggest")
-    def suggest_match(key: str, target: str, use_gemini: Annotated[bool, Form()] = False):
+    def suggest_match(key: str, target: str):
         with store.connection() as db:
             meta = get_row(db, "documents", key, "batch, role")
             docs = documents(db, meta["batch"])
@@ -633,7 +785,7 @@ def create_app(path):
             scope = get_row(db, "batches", meta["batch"], "scope_mode, scope")
             material = [row for row in bom["lines"] if row["anchors"] and not row.get("excluded") and row.get("kind") != "service"]
             anchored = schedule_baseline(material, scope["scope_mode"], json.loads(scope["scope"]))[:80]
-        ids, message = suggest(line, anchored, use_gemini=use_gemini)
+        ids, message = suggest(line, anchored)
         return {"candidates": ids, "message": message}
 
     @app.post("/batches/{batch}/verify")

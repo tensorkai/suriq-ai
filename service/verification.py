@@ -182,7 +182,10 @@ def summary_quote(doc):
     if doc["role"] != "quote" or doc["lines"] or not doc.get("classification", {}).get("summary_only"):
         return False
     return any((amount := decimal_value(doc["terms"].get(field, ""))) is not None and amount >= 0
-               and (anchor := evidence(doc, field=field)) and not anchor.get("weak")
+               and (anchor := evidence(doc, field=field)) and (
+                   not anchor.get("weak") or anchor.get("method") == "model"
+                   and doc.get("provenance", {}).get("provider") == "gemini"
+               )
                for field in ("materials_total", "total"))
 
 

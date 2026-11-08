@@ -280,6 +280,15 @@ def test_weak_ocr_creates_source_review(tmp_path, monkeypatch):
         issue = next(item for item in view["issues"] if item["rule"] == "extraction")
         assert issue["review_required"] and not issue["confirmable"]
         assert issue["evidence"][0]["document"] == quote and issue["evidence"][0]["source"] == 1
+        assert issue["evidence"][0]["scope"] == "page"
+        result = ok(client.post(f"/documents/{quote}/search", json={"query": "8000"}))
+        assert result["searchable"] and result["matches"][0]["source"] == 1
+
+        import sqlite3
+        with sqlite3.connect(tmp_path / "test.sqlite") as connection:
+            connection.execute("UPDATE snapshots SET content = json_remove(content, '$.ocr_search') WHERE document = ?", (quote,))
+        old_result = ok(client.post(f"/documents/{quote}/search", json={"query": "80"}))
+        assert old_result["searchable"] and old_result["partial"] and old_result["matches"][0]["source"] == 1
         assert view["comparison"][0]["total"] is None
 
 
@@ -296,3 +305,39 @@ def test_unlabeled_roles_follow_contents_and_multiple_boms_block(tmp_path):
         ok(client.post(route, files={"file": ("other.xlsx", xlsx([BOM]))}))
         blocked = client.post(f"/batches/{batch}/verify")
         assert blocked.status_code == 409 and "Multiple BOMs" in blocked.json()["detail"]
+
+
+def test_review_actions_and_source_search(tmp_path):
+    with TestClient(create_app(tmp_path / "test.sqlite")) as client:
+        batch = create(client)
+        different = ["B-088", "Copper pipe", "2", "pcs", "100", "200"]
+        bom = upload(client, batch, "BOM.pdf", pdf([BOM, [*different[:4], "", ""]], page=2,
+                                                  terms=["Delivery: 2027-01-01"]))
+        quote = upload(client, batch, "Offer.pdf", pdf([different], page=3), "Supplier A")
+        view = ok(client.get(f"/batches/{batch}"))
+        assert view["verification_action"] == {"kind": "scope", "document": bom}
+        search = ok(client.post(f"/documents/{quote}/search", json={"query": "copper pipe"}))
+        assert search["searchable"] and [match["source"] for match in search["matches"]] == [3]
+        assert "Copper pipe" in search["matches"][0]["text"]
+        thumbnail = client.get(f"/documents/{quote}/thumbnail/3")
+        assert thumbnail.is_success and thumbnail.content.startswith(b"\x89PNG")
+        assert len(thumbnail.content) < len(client.get(f"/documents/{quote}/page/3").content)
+        assert client.get(f"/documents/{quote}/thumbnail/99").status_code == 404
+        assert ok(client.post(f"/documents/{quote}/search", json={"query": "B-014"}))["matches"] == []
+        unicode_note = "Straße " * 90 + "Copper marker"
+        sheet = upload(client, batch, "Other.xlsx", xlsx([different], [f"Memo: {unicode_note}"]), "Supplier B")
+        unicode_matches = ok(client.post(f"/documents/{sheet}/search", json={"query": "copper marker"}))["matches"]
+        assert unicode_matches[0]["text"].endswith("Copper marker")
+        matches = ok(client.post(f"/documents/{sheet}/search", json={"query": "B-088"}))["matches"]
+        assert matches == [{"source": "Materials", "text": "B-088 | Copper pipe | 2 | pcs | 100 | 200"}]
+        ok(client.patch(f"/batches/{batch}/scope", json={"mode": "all"}))
+        view = ok(client.post(f"/batches/{batch}/verify"))
+        missing = next(issue for issue in view["issues"] if issue["rule"] == "missing")
+        assert any(e.get("scope") == "document" and e["document"] == quote for e in missing["evidence"])
+        assert missing["search_hint"] == "B-014"
+        freight = next(issue for issue in view["issues"] if issue["rule"] == "charges"
+                       and issue["subject"][0] == quote)
+        assert freight["source_editors"] == [{"document": quote, "target": "terms", "field": "freight"}]
+        delivery = next(issue for issue in view["issues"] if issue["rule"] == "delivery")
+        assert {editor["document"] for editor in delivery["source_editors"]} == {quote, sheet}
+        assert all(editor["field"] == "delivery" for editor in delivery["source_editors"])

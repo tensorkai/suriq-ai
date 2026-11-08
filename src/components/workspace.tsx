@@ -6,7 +6,8 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Activity, SupplierComparison } from "./comparison";
-import { Documents } from "./documents";
+import { canChangeType, Documents } from "./documents";
+import type { DocumentDestination } from "./documents";
 import { Findings } from "./findings";
 import { api } from "./model";
 import type { Batch, Document, Project } from "./model";
@@ -19,6 +20,11 @@ const views = [
   { id: "activity", label: "Activity", Icon: ActivityIcon },
 ] as const;
 type View = typeof views[number]["id"];
+
+const blockerLabels = {
+  upload: "Add missing documents", type: "Confirm document type", scope: "Set purchase scope",
+  retry: "Open failed file", manage: "Manage source file", read: "Review document",
+};
 type Dialog = { kind: "project" } | { kind: "batch"; project: Project } |
   { kind: "upload"; revises?: Document } | { kind: "manageProject"; project: Project } | { kind: "manageBatch" } |
   { kind: "manageFile"; doc: Document };
@@ -29,6 +35,8 @@ export function Workspace() {
   const [projectSelection, setProjectSelection] = useState("");
   const [batch, setBatch] = useState<Batch | null>(null);
   const [view, setView] = useState<View>("documents");
+  const [docTarget, setDocTarget] = useState<{ destination?: DocumentDestination; key: number }>({ key: 0 });
+  const [finding, setFinding] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [working, setWorking] = useState(false);
@@ -95,6 +103,7 @@ export function Workspace() {
 
   function openBatch(id: string, projectId: string) {
     setError(""); setProjectSelection(projectId); setSelection(id); setView("documents");
+    setDocTarget({ key: 0 }); setFinding("");
     if (!id) window.localStorage.removeItem("suriq-batch");
   }
 
@@ -105,6 +114,24 @@ export function Workspace() {
     } else {
       const item = await api<{ id: string }>(`/projects/${projectId}/batches`, "POST", { name });
       await loadProjects(); openBatch(item.id, projectId!);
+    }
+  }
+
+  function openDocument(destination: DocumentDestination) {
+    setDocTarget((current) => ({ destination, key: current.key + 1 }));
+    setView("documents");
+  }
+
+  function resolveBlocker() {
+    const action = active?.verification_action;
+    if (!active || !action) return;
+    if (action.kind === "upload") {
+      setDialog({ kind: "upload" });
+    } else if (action.kind === "manage") {
+      const doc = active.documents.find((item) => item.id === action.document);
+      if (doc) setDialog({ kind: "manageFile", doc });
+    } else {
+      openDocument({ document: action.document, kind: action.kind });
     }
   }
 
@@ -157,7 +184,7 @@ export function Workspace() {
                   <PendingButton className="button primary" type="button" disabled={!canVerify} pending={working}
                     pendingLabel="Verifying…" icon={<ScanLine size={17} />} onClick={async () => {
                     setWorking(true); setError("");
-                    try { accept(await api<Batch>(`/batches/${active.id}/verify`, "POST")); setView("findings"); }
+                    try { accept(await api<Batch>(`/batches/${active.id}/verify`, "POST")); setFinding(""); setView("findings"); }
                     catch (error) { setError((error as Error).message); }
                     finally { setWorking(false); }
                   }}>Run verification</PendingButton>
@@ -166,7 +193,12 @@ export function Workspace() {
               {processing ? <LoadingNotice className="batch-progress">
                 Reading {processingCount} {processingCount === 1 ? "document" : "documents"}…
               </LoadingNotice> : active.documents.length > 0 && active.verification_problem &&
-                <p className="notice" role="status">{active.verification_problem}</p>}
+                <div className="notice inline">
+                  <span role="status">{active.verification_problem}</span>
+                  {active.verification_action && <button className="button secondary" type="button" onClick={resolveBlocker}>
+                    {blockerLabels[active.verification_action.kind]}
+                  </button>}
+                </div>}
               <div className="batch-stats">
                 <div><span>Source files</span><strong>{active.documents.length}</strong><small>{quotes} supplier {quotes === 1 ? "offer" : "offers"}</small></div>
                 <div><span>Findings</span><strong>{verified ? active.issues.length : "—"}</strong><small>{verified ? `${blocked} blocking · ${warnings} warnings` : "Awaiting verification"}</small></div>
@@ -179,15 +211,24 @@ export function Workspace() {
             <section className="panel workspace-panel">
               <div className="viewbar">
                 <nav aria-label="Batch workspace">{views.map(({ id, label, Icon }) => <button key={id} type="button"
-                  aria-current={view === id ? "page" : undefined} onClick={() => setView(id)}>
+                  aria-current={view === id ? "page" : undefined} onClick={() => {
+                    if (id !== view && id === "documents") setDocTarget({ key: 0 });
+                    if (id !== view && id === "findings") setFinding("");
+                    setView(id);
+                  }}>
                   <Icon size={16} />{label}{id === "findings" && verified && <span>{active.issues.length}</span>}</button>)}</nav>
                 {verified && <details className="export-menu"><summary className="button secondary"><ArrowDownToLine size={16} /> Export</summary>
                   <div><a href={`/api/batches/${active.id}/export/pdf`}>Download PDF</a><a href={`/api/batches/${active.id}/export/csv`}>Download CSV</a></div></details>}
               </div>
-              {view === "documents" && <Documents key={active.id} batch={active} update={accept}
+              {view === "documents" && <Documents key={`${active.id}:${docTarget.key}`} batch={active} update={accept} destination={docTarget.destination}
+                onEditorClose={docTarget.destination?.kind === "edit" ? () => setView("findings") : undefined}
                 upload={() => setDialog({ kind: "upload" })} revise={(doc) => setDialog({ kind: "upload", revises: doc })} manage={(doc) => setDialog({ kind: "manageFile", doc })} />}
-              {view === "findings" && <Findings key={active.id} batch={active} update={accept} />}
-              {view === "comparison" && <SupplierComparison batch={active} />}
+              {view === "findings" && <Findings key={`${active.id}:${finding}`} batch={active} update={accept} initial={finding}
+                editSource={(editor, issueId) => {
+                  setFinding(issueId);
+                  openDocument({ document: editor.document, kind: "edit", editor });
+                }} />}
+              {view === "comparison" && <SupplierComparison batch={active} openFinding={(id) => { setFinding(id); setView("findings"); }} />}
               {view === "activity" && <Activity batch={active} />}
             </section>
           </>}
@@ -220,7 +261,11 @@ export function Workspace() {
     {dialog?.kind === "manageFile" && <NameDialog title="Manage source file" initial={dialog.doc.name}
       close={() => setDialog(null)} remove={async () => {
         accept(await api<Batch>(`/documents/${dialog.doc.id}`, "DELETE"));
-      }} deletion="Remove source from this batch" />}
+      }} deletion="Remove source from this batch"
+      extra={canChangeType(dialog.doc) && <button className="button secondary" type="button" onClick={() => {
+        openDocument({ document: dialog.doc.id, kind: "type" });
+        setDialog(null);
+      }}>Change document type</button>} />}
   </div>;
 }
 
@@ -236,9 +281,9 @@ function Welcome({ project, start }: { project?: Project; start: () => void }) {
   </section>;
 }
 
-function NameDialog({ title, label, initial = "", submit, close, save, remove, deletion }: {
+function NameDialog({ title, label, initial = "", submit, close, save, remove, deletion, extra }: {
   title: string; label?: string; initial?: string; submit?: string; close: () => void;
-  save?: (value: string) => Promise<void>; remove?: () => Promise<void>; deletion?: string;
+  save?: (value: string) => Promise<void>; remove?: () => Promise<void>; deletion?: string; extra?: React.ReactNode;
 }) {
   const [value, setValue] = useState(initial);
   const [error, setError] = useState("");
@@ -260,6 +305,7 @@ function NameDialog({ title, label, initial = "", submit, close, save, remove, d
       {error && <p className="error" role="alert">{error}</p>}
       {save && <PendingButton className="button primary" type="submit" disabled={working !== null || !value.trim()}
         pending={working === "save"} pendingLabel={submit?.startsWith("Create") ? "Creating…" : "Saving…"}>{submit}</PendingButton>}
+      {extra}
       {remove && (confirm ? <div className="notice"><strong>{deletion}?</strong><div className="inline">
         <PendingButton className="button danger" type="button" disabled={working !== null}
           pending={working === "remove"} pendingLabel="Removing…" onClick={() => void act("remove", remove)}>Confirm removal</PendingButton>
@@ -275,9 +321,8 @@ function UploadDialog({ batch, revises, update, close }: {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [files, setFiles] = useState<File[]>([]);
-  const [share, setShare] = useState(false);
   const [uploaded, setUploaded] = useState(0);
-  const sharingAvailable = batch.ai.provider === "gemini" && batch.ai.configured;
+  const hostedReading = batch.ai.provider === "gemini" && batch.ai.configured;
   return <Modal title={revises ? "Upload revised quotation" : "Add BOM and supplier quotation files"} close={close} busy={busy}>
     <form className="modal-body stack" onSubmit={async (event) => {
       event.preventDefault(); setBusy(true); setUploaded(0); setError("");
@@ -287,7 +332,6 @@ function UploadDialog({ batch, revises, update, close }: {
         for (const file of files) {
           const data = new FormData();
           data.append("file", file);
-          if (sharingAvailable && share) data.append("use_gemini", "true");
           if (revises) data.append("revises", revises.id);
           try { await api(`/batches/${batch.id}/documents`, "POST", data); }
           catch (error) { remaining.push(file); failures.push(`${file.name}: ${(error as Error).message}`); }
@@ -307,10 +351,7 @@ function UploadDialog({ batch, revises, update, close }: {
         <input type="file" name="file" accept=".pdf,.xlsx,.docx" multiple={!revises} disabled={busy}
           onChange={(event) => setFiles(Array.from(event.currentTarget.files ?? []))} /></label>
       {files.length > 0 && <p className="muted">{files.map((file) => file.name).join(", ")}</p>}
-      {sharingAvailable && <label className="inline sharing-consent">
-        <input type="checkbox" checked={share} disabled={busy} onChange={(event) => setShare(event.target.checked)} />
-        <span>Allow assisted reading<small>Google may receive excerpts and page images. Select only for non-confidential files.</small></span>
-      </label>}
+      {hostedReading && <p className="fine-print">Google processes document excerpts and page images to read these files.</p>}
       {busy && <div className="upload-progress">
         <div className="inline" role="status"><Spinner />{uploaded < files.length
           ? `Uploading file ${uploaded + 1} of ${files.length}` : "Opening uploaded files…"}</div>

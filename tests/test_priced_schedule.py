@@ -43,18 +43,26 @@ def priced_schedule():
 
 def test_split_schedule_keeps_prices_services_and_supplier_baselines_separate(tmp_path, monkeypatch):
     from service import gemini
+    from service.adaptive import Interpretation
 
     monkeypatch.setenv("SURIQ_AI_PROVIDER", "gemini")
     monkeypatch.setenv("GEMINI_API_KEY", "synthetic-test-key")
 
-    def reject_cloud(*args, **kwargs):
-        raise AssertionError("Recognized schedule pages should use native extraction.")
+    def interpret(model, schema, instructions, payload, **kwargs):
+        vendor = next((element for element in payload["elements"] if element["text"].startswith("Vendor ")), None)
+        if not vendor:
+            return Interpretation(role="unknown", rationale="No change", evidence=[], rows=[], terms=[])
+        name = vendor["text"].split(" RECONSTRUCTED")[0]
+        return Interpretation.model_validate({
+            "role": "quote", "rationale": "Supplier letterhead", "evidence": [vendor["id"]], "rows": [],
+            "terms": [{"field": "supplier", "element": vendor["id"], "value": name}],
+        })
 
-    monkeypatch.setattr(gemini, "send", reject_cloud)
+    monkeypatch.setattr(gemini, "chat", interpret)
     with TestClient(create_app(tmp_path / "workspace.sqlite")) as client:
         batch = create(client)
         route = f"/batches/{batch}/documents"
-        ok(client.post(route, data={"use_gemini": "true"}, files={"file": ("schedule.pdf", priced_schedule())}))
+        ok(client.post(route, files={"file": ("schedule.pdf", priced_schedule())}))
         ok(client.post(route, files={"file": ("offer.xlsx", xlsx(
             [["1", "Copper conductor 30 mm2", "2", "m", "125", "250"]], ["Supplier: Vendor One"]
         ))}))
@@ -62,6 +70,8 @@ def test_split_schedule_keeps_prices_services_and_supplier_baselines_separate(tm
         bom, quote = view["documents"]
         material, service, other = bom["lines"]
         assert bom["status"] == "ready" and bom["role"] == "bom"
+        assert not bom["classification"]["bundled_offers"]
+        assert bom["provenance"]["provider"] == "gemini"
         assert material["fields"]["material"] == "Copper conductor 30 mm2"
         assert material["fields"]["unit_price"] == "125.00" and material["fields"]["amount"] == "250.00"
         assert material["fields"]["labor_amount"] == "50.00" and material["fields"]["line_total"] == "300.00"

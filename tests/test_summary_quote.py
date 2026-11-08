@@ -46,7 +46,7 @@ def test_right_aligned_bom_and_summary_quote_can_be_verified(tmp_path, monkeypat
         page.drawString(45, 620, "Price validity:")
         page.drawString(280, 620, "20 days, subject to supplier confirmation")
 
-    monkeypatch.setenv("SURIQ_AI_PROVIDER", "gemini")
+    monkeypatch.setenv("SURIQ_AI_PROVIDER", "off")
     monkeypatch.setenv("GEMINI_API_KEY", "synthetic-key")
 
     def no_cloud(*args, **kwargs):
@@ -57,7 +57,7 @@ def test_right_aligned_bom_and_summary_quote_can_be_verified(tmp_path, monkeypat
         batch = create(client)
         route = f"/batches/{batch}/documents"
         for name, draw in (("schedule.pdf", draw_bom), ("offer.pdf", draw_quote)):
-            ok(client.post(route, data={"use_gemini": "true"}, files={"file": (name, make_pdf(draw))}))
+            ok(client.post(route, files={"file": (name, make_pdf(draw))}))
         view = ok(client.get(f"/batches/{batch}"))
         bom, quote = view["documents"]
         row, = bom["lines"]

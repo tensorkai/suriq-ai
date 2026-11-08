@@ -18,7 +18,7 @@ MAX_ROWS = int(os.getenv("SURIQ_MAX_ROWS", "500"))
 MAX_COLUMNS = 64
 OCR_CONFIDENCE = int(os.getenv("SURIQ_OCR_CONFIDENCE", "75"))
 NS = "{http://www.w3.org/1999/xhtml}"
-PARSER_VERSION = "native-2.3"
+PARSER_VERSION = "native-2.4"
 
 LINE_FIELDS = {
     "code": "item id|bom item id|id|item no|item number|no|code|part no|part number|sku",
@@ -56,10 +56,10 @@ TERM_FIELDS = {
     "tax": "tax|tax basis|vat status|vat basis|vat treatment",
     "vat": "vat|vat amount|12% vat|vat 12%",
     "subtotal": "subtotal|sub total",
-    "total": "grand total|total payable|total amount due|total|total quotation|quotation total",
-    "materials_total": "materials|materials total|total materials|material cost|supplier stated materials total",
-    "item_extensions_total": "sum of item extensions|item extensions total",
-    "labor_equipment": "labor, equipment, tools|labor and equipment|labor and tools",
+    "total": "grand total|total payable|total amount due|total|total quotation|quotation total|total project cost|total contract price|total project cost including applicable markups",
+    "materials_total": "materials|materials total|total materials|material cost|supplier stated materials total|material cost per project quotation",
+    "item_extensions_total": "sum of item extensions|item extensions total|subtotal of item extensions",
+    "labor_equipment": "labor, equipment, tools|labor and equipment|labor and tools|tools, equipment & labor",
     "mobilization": "mobilization and consumables|mobilization",
     "advance_payment": "advance payment|down payment",
     "balance_payment": "balance upon completion|balance payment",
@@ -95,16 +95,31 @@ SPLIT_HEADER = re.compile(
 )
 SPLIT_SUBHEADER = re.compile(r"^unit rate unit rate extension extension total$", re.I)
 DRAFT_MARK = re.compile(r"reconstructed\s*/\s*not issued", re.I)
+REVERSED_SPLIT_HEADER = re.compile(
+    r"^(?:no|item no) (?:description / specification|specification / work item|description|work item) "
+    r"(?:qty|quantity) unit unit rate unit rate total total line total$", re.I,
+)
+REVERSED_SPLIT_SUBHEADER = re.compile(r"^material labou?r material labou?r(?: php)?$", re.I)
+PAGE_TITLE = re.compile(r"^(.+?)\s+(bill of (?:materials|quantities)|quotation)$", re.I)
 SCHEDULE_PRICE_FIELDS = ("unit_price", "labor_unit_price", "amount", "labor_amount", "line_total")
 SCHEDULE_ROW = re.compile(
     rf"^(?P<code>\d+|[A-Z]+[-.]\d+)\s+(?P<material>.+?)\s+(?P<quantity>{NUMBER_PATTERN})\s+"
     rf"(?P<unit>{UNIT_PATTERN})" +
     "".join(rf"\s+(?P<{field}>{PRICE_PATTERN}|[-–—])" for field in SCHEDULE_PRICE_FIELDS) + "$", re.I,
 )
+SPLIT_VALUES = re.compile(
+    rf"^(?P<code>\d+|[A-Z]+[-.]\d+)\s+(?P<quantity>{NUMBER_PATTERN})\s+(?P<unit>{UNIT_PATTERN})" +
+    "".join(rf"\s+(?P<{field}>{PRICE_PATTERN}|[-–—])" for field in SCHEDULE_PRICE_FIELDS) + "$", re.I,
+)
+SIMPLE_VALUES = re.compile(
+    rf"^(?P<code>\d+|[A-Z]+[-.]\d+)\s+(?P<quantity>{NUMBER_PATTERN})\s+(?P<unit>{UNIT_PATTERN})"
+    rf"\s+(?P<unit_price>{PRICE_PATTERN})\s+(?P<amount>{PRICE_PATTERN})$", re.I,
+)
 SCHEDULE_TOTAL_LABELS = {
     "materials extension", "extended material costs", "extended labor / site services",
     "extended labour / site services", "total detailed schedule", "quoted project total",
-    "unclassified difference to quotation", "non-schedule profit / tax provisions",
+    "unclassified difference to quotation", "non-schedule profit / tax provisions", "materials total",
+    "labor + work-only services", "total contract price", "total direct cost",
 }
 
 
@@ -313,8 +328,9 @@ def pdf_term(raw):
         return "tax", raw, (0, len(raw))
     money = re.fullmatch(rf"(?P<label>.+?)\s+(?P<value>{PRICE_PATTERN})", raw, re.I)
     if money:
-        name = re.sub(r"\s+\([^()]*\)$", "", money["label"].rstrip(":"))
-        name = label(name.replace("-", " "))
+        name = re.sub(r"^\d+(?:\.\d+)+\s+", "", money["label"].rstrip(":"))
+        name = re.sub(r"\s+\([^()]*\)$", "", name)
+        name = " ".join(label(name.replace("-", " ")).split())
         field = TERM_ALIASES.get(name)
         if re.fullmatch(r"sum of \d+ item extensions", name):
             field = "item_extensions_total"
@@ -334,20 +350,22 @@ def pdf_term(raw):
 def split_schedule(snapshot, source, rows):
     """Read a priced BOQ only when both levels of its header agree."""
     texts = [" ".join(word[0] for word in row) for row in rows]
-    header = next((i for i, raw in enumerate(texts[:-1]) if SPLIT_HEADER.fullmatch(label(raw))
-                   and SPLIT_SUBHEADER.fullmatch(label(texts[i + 1]))), None)
+    header = next((i for i, raw in enumerate(texts[:-1]) if (
+        SPLIT_HEADER.fullmatch(label(raw)) and SPLIT_SUBHEADER.fullmatch(label(texts[i + 1]))
+        or REVERSED_SPLIT_HEADER.fullmatch(label(raw)) and REVERSED_SPLIT_SUBHEADER.fullmatch(label(texts[i + 1]))
+    )), None)
     if header is None:
         return False
 
     ref = source["ref"]
-    issuer = site = ""
+    issuer, site = source.get("issuer", ""), ""
     for index, raw in enumerate(texts[:header]):
         keep_heading(snapshot, word_anchor(ref, rows[index]), True)
         if draft := DRAFT_MARK.search(raw):
             issuer = issuer or raw[:draft.start()].strip()
             add_term(snapshot, ("draft_notice", draft.group(), word_anchor(ref, words_in_span(rows[index], *draft.span()))))
         if location := re.search(r"\bproject site:\s*(.+)$", raw, re.I):
-            site = location[1].strip()
+            site = re.split(r"\s+quotation date:", location[1], maxsplit=1, flags=re.I)[0].strip()
         if supplier := re.match(r"^(?:supplier|contractor):\s*(.+)$", raw, re.I):
             issuer = issuer or supplier[1].strip()
     source["schedule"] = " · ".join(part for part in (issuer, site) if part) if issuer else f"Unidentified schedule · page {ref}"
@@ -356,10 +374,26 @@ def split_schedule(snapshot, source, rows):
     count = 0
     for index in range(header + 2, len(rows)):
         raw, row = texts[index], rows[index]
-        if match := SCHEDULE_ROW.fullmatch(raw):
-            fields = match.groupdict()
-            groups = {field: words_in_span(row, *match.span(field)) for field in fields}
+        match = SCHEDULE_ROW.fullmatch(raw)
+        description = []
+        if not match and index > header + 2 and (match := SPLIT_VALUES.fullmatch(raw)):
+            prior = rows[index - 1]
+            # The description column is left of quantity and inset from section headings.
+            if not row[0][1][0] + .015 < prior[0][1][0] < row[1][1][0] or prior[-1][1][0] >= row[1][1][0]:
+                continue
+            description = list(prior)
+            if index + 1 < len(rows):
+                following = rows[index + 1]
+                if abs(following[0][1][0] - prior[0][1][0]) < .01 and following[-1][1][0] < row[1][1][0] and (
+                    index + 2 == len(rows) or not SPLIT_VALUES.fullmatch(texts[index + 2])
+                ):
+                    description.extend(following)
+        if match:
+            groups = {field: words_in_span(row, *match.span(field)) for field in match.groupdict()}
+            if description:
+                groups["material"] = description
             anchors = {field: word_anchor(ref, words) for field, words in groups.items()}
+            fields = {field: anchor["text"] for field, anchor in anchors.items()}
             line = make_line(ref, index + 1, fields, anchors, groups)
             service = service_page or fields["unit_price"] in {"-", "–", "—"} and fields["amount"] in {"-", "–", "—"}
             line.update({"kind": "service" if service else "material", "schedule": source["schedule"]})
@@ -382,6 +416,19 @@ def split_schedule(snapshot, source, rows):
 def pdf_rows(snapshot, source, rows, inherited):
     columns = inherited
     previous = None
+    split_rows = {}
+    for index, row in enumerate(rows[1:], 1):
+        values = SIMPLE_VALUES.fullmatch(" ".join(word[0] for word in row))
+        prior = rows[index - 1]
+        if (values and len(row) >= 5 and row[1][1][0] - row[0][1][0] > .12
+                and row[0][1][0] + .015 < prior[0][1][0] < row[1][1][0]
+                and prior[-1][1][0] < row[1][1][0]):
+            split_rows[index + 1] = (values, prior)
+    if len(split_rows) < 2 or not any(
+        re.fullmatch(r"(?:item|item no|no|code) (?:description|material) (?:qty|quantity) unit unit (?:price|cost) amount",
+                     label(" ".join(word[0] for word in row)), re.I) for row in rows[:15]
+    ):
+        split_rows.clear()
     for index, row in enumerate(rows, 1):
         raw = " ".join(word[0] for word in row)
         if len(raw) > 4000:
@@ -400,6 +447,17 @@ def pdf_rows(snapshot, source, rows, inherited):
         table_term = term_from_cells([(raw, None)], lambda _: word_anchor(source, row))
         if table_term:
             add_term(snapshot, table_term)
+            continue
+
+        if index in split_rows:
+            values, description = split_rows[index]
+            groups = {field: words_in_span(row, *values.span(field)) for field in values.groupdict()}
+            groups["material"] = description
+            anchors = {field: word_anchor(source, words) for field, words in groups.items()}
+            fields = {field: anchor["text"] for field, anchor in anchors.items()}
+            snapshot["lines"].append(make_line(source, index, fields, anchors, groups))
+            continue
+        if split_rows and not NUMBERED_LINE.fullmatch(raw):
             continue
 
         # Centered headers and right-aligned values do not share left edges.
@@ -501,10 +559,50 @@ def extract_pdf(path, snapshot, directory, pdf_words):
             source["warning"] = "Low-confidence OCR. Check the extracted values against this page."
         snapshot["sources"].append(source)
         pdf_words[page] = row_groups(words)
+        for row in pdf_words[page][:4]:
+            heading = " ".join(word[0] for word in row)
+            title = PAGE_TITLE.fullmatch(heading)
+            if not title:
+                continue
+            # A spaced letterhead identifies the issuer and document type independently.
+            title_words = words_in_span(row, *title.span(2))
+            issuer_words = words_in_span(row, *title.span(1))
+            if not issuer_words or not title_words or title_words[0][1][0] - sum(issuer_words[-1][1][::2]) < .035:
+                continue
+            source["issuer"] = title[1]
+            keep_heading(snapshot, word_anchor(page, title_words), True)
+            if title[2].casefold() == "quotation":
+                source["offer_issuer"] = title[1]
+                add_term(snapshot, ("supplier", title[1], word_anchor(page, issuer_words)))
+            break
+        if source.get("offer_issuer"):
+            for row in pdf_words[page]:
+                raw = " ".join(word[0] for word in row)
+                if "not evidence of a supplier-issued offer" in raw.casefold():
+                    add_term(snapshot, ("draft_notice", raw, word_anchor(page, row)))
+                    break
+        if source["method"] == "ocr" and words:
+            snapshot.setdefault("ocr_search", {})[str(page)] = [
+                " ".join(word[0] for word in row)[:500] for row in pdf_words[page][:MAX_ROWS]
+            ]
         if split_schedule(snapshot, source, pdf_words[page]):
             columns = []
         else:
+            start = len(snapshot["lines"])
             columns = pdf_rows(snapshot, page, pdf_words[page], columns)
+            source["structured_rows"] = bool(snapshot["lines"][start:]) and all(
+                line["fields"].get("code") and line["fields"].get("quantity") and line["fields"].get("unit")
+                for line in snapshot["lines"][start:]
+            )
+            source["cost_summary"] = bool(source.get("offer_issuer")) and any(
+                re.search(r"\b(?:project|works|work|replacement).*cost summary\b", " ".join(w[0] for w in row), re.I)
+                for row in pdf_words[page]
+            )
+            if source["cost_summary"]:
+                snapshot["lines"][start:] = [
+                    line for line in snapshot["lines"][start:]
+                    if line["fields"].get("quantity") and line["fields"].get("unit")
+                ]
     if len(snapshot["sources"]) != int(pages[1]):
         raise ExtractionError("Could not index every PDF page.")
 
@@ -668,7 +766,7 @@ def extract_docx(path, snapshot):
                                            for row in element.findall(ns + "tr")])
 
 
-def extract(content, kind, *, on_inference=lambda: None, use_gemini=False):
+def extract(content, kind, *, on_inference=lambda: None):
     from service.adaptive import assist
     from service.classification import classify
 
@@ -690,7 +788,7 @@ def extract(content, kind, *, on_inference=lambda: None, use_gemini=False):
         except (BadZipFile, InvalidFileException, ElementTree.ParseError, OSError, KeyError, ValueError) as exc:
             raise ExtractionError("The source could not be decoded. Check the file and retry.") from exc
         classification = classify(snapshot)
-        assist(snapshot, path, directory, pdf_words, classification, on_inference, use_gemini)
+        assist(snapshot, path, directory, pdf_words, classification, on_inference)
         snapshot["classification"] = classify(snapshot)
     snapshot.pop("headings")
     return snapshot

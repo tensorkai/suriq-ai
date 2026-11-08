@@ -10,11 +10,12 @@ TERMS = ["Subtotal: 8000", "Tax: VAT inclusive", "Freight: Included", "Discount:
 COLUMNS = [40, 103, 320, 362, 410, 498]
 
 
-def pdf(rows, page=1, pages=3, terms=()):
+def pdf(rows, page=1, pages=3, terms=(), blank_page=None):
     output = BytesIO()
     canvas = Canvas(output)
     for index in range(1, pages + 1):
-        canvas.drawString(40, 790, f"Procurement document / {index}")
+        if index != blank_page:
+            canvas.drawString(40, 790, f"Procurement document / {index}")
         if index == page:
             for offset, values in enumerate([HEADERS, *rows]):
                 for x, value in zip(COLUMNS, values):

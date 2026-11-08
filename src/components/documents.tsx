@@ -2,28 +2,42 @@
 
 import { FileText, Link2, Pencil, Plus, RotateCcw, UploadCloud } from "lucide-react";
 import { useState } from "react";
-import { api, docName, documentFeedback, lineFields, procurementRows, sourceName, termFields } from "./model";
-import type { Anchor, Batch, Coverage, Document, Line, Scope } from "./model";
+import { api, coverageLabel, docName, documentFeedback, lineFields, procurementRows, sourceName, supplierNameNeeded, termFields } from "./model";
+import type { Anchor, Batch, Coverage, Document, Line, Scope, SourceEditor } from "./model";
 import { Empty, LoadingNotice, Modal, PendingButton, Pill, Spinner } from "./shared";
-import { SourceViewer, Zoom } from "./viewer";
+import { SourceViewer } from "./viewer";
 import type { Link } from "./viewer";
 
 const statusLabel = { ready: "Ready", processing: "Reading document", needs_review: "Needs review", failed: "Failed" };
-const coverageLabel = { full: "Full scope", partial: "Partial offer", unknown: "Coverage unknown" };
 
-export function Documents({ batch, update, upload, revise, manage }: {
+export type DocumentDestination = {
+  document: string; kind: "type" | "scope" | "retry" | "read" | "edit"; editor?: SourceEditor;
+};
+
+export function canChangeType(doc: Document) {
+  return (doc.status === "ready" || doc.status === "needs_review") && doc.role !== "unsupported" && !doc.superseded_by && !doc.classification?.bundled_offers?.length;
+}
+
+export function Documents({ batch, update, upload, revise, manage, destination, onEditorClose }: {
+  destination?: DocumentDestination; onEditorClose?: () => void;
   batch: Batch; update: (value: Batch) => void; upload: () => void; revise: (doc: Document) => void; manage: (doc: Document) => void;
 }) {
-  const [selected, select] = useState("");
-  const [mode, setMode] = useState<"extraction" | "source" | "terms">("extraction");
-  const [editor, edit] = useState<Line | "terms" | "new" | null>(null);
-  const [zoom, setZoom] = useState(100);
-  const [scope, setScope] = useState(false);
-  const [error, setError] = useState("");
-  const [busy, setBusy] = useState<"coverage" | "retry" | "assisted" | "type" | null>(null);
-  const sharingAvailable = batch.ai.provider === "gemini" && batch.ai.configured;
+  const [selected, select] = useState(destination?.document ?? "");
+  const [mode, setMode] = useState<"extraction" | "source" | "terms">(
+    destination?.editor?.target === "terms" ? "terms" : "extraction"
+  );
   const doc = batch.documents.find((item) => item.id === selected) ?? batch.documents[0];
-  const boms = batch.documents.filter((item) => item.role === "bom");
+  const [editor, edit] = useState<Line | "terms" | "new" | null>(() => {
+    const target = destination?.editor?.target;
+    if (target === "terms" || target === "new") return target;
+    return doc?.lines.find((line) => line.id === target) ?? null;
+  });
+  const [editorContext, setEditorContext] = useState(destination?.editor);
+  const [scope, setScope] = useState(destination?.kind === "scope");
+  const [type, setType] = useState(destination?.kind === "type");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState<"coverage" | "retry" | null>(null);
+  const boms = batch.documents.filter((item) => item.role === "bom" && !item.superseded_by);
   const bom = boms.length === 1 ? boms[0] : undefined;
   const revisedFrom = batch.documents.find((item) => item.id === doc?.revises);
   const revisedTo = batch.documents.find((item) => item.id === doc?.superseded_by);
@@ -48,15 +62,10 @@ export function Documents({ batch, update, upload, revise, manage }: {
     } finally { setBusy(null); }
   }
 
-  async function retryExtraction(share: boolean) {
-    const data = new FormData();
-    if (share) {
-      if (!window.confirm("Allow Google to receive excerpts and page images for assisted reading? Continue only if the file is non-confidential.")) return;
-      data.append("use_gemini", "true");
-    }
-    setBusy(share ? "assisted" : "retry"); setError("");
+  async function retryExtraction() {
+    setBusy("retry"); setError("");
     try {
-      await api(`/documents/${doc.id}/retry`, "POST", data);
+      await api(`/documents/${doc.id}/retry`, "POST");
       update(await api<Batch>(`/batches/${batch.id}`));
     } catch (error) { setError((error as Error).message); }
     finally { setBusy(null); }
@@ -67,7 +76,7 @@ export function Documents({ batch, update, upload, revise, manage }: {
       <div className="issue-rail-heading"><span>Documents</span><span>{batch.documents.length}</span></div>
       {batch.documents.map((item) => <button key={item.id} className={`document-choice ${doc.id === item.id ? "selected" : ""}`}
         type="button" aria-current={doc.id === item.id ? "true" : undefined}
-        onClick={() => { select(item.id); setMode("extraction"); setError(""); }}>
+        onClick={() => { select(item.id); setMode("extraction"); setError(""); setEditorContext(undefined); }}>
         <span className={`file-glyph ${item.role}`}><FileText size={17} /></span>
         <span><strong>{docName(item)}</strong><small>{item.name}</small><span className="document-status">{item.status === "processing" && <Spinner />}{item.superseded_by ? "Superseded" : statusLabel[item.status]}</span></span>
       </button>)}
@@ -76,12 +85,15 @@ export function Documents({ batch, update, upload, revise, manage }: {
     <section className="document-detail">
       <div className="detail-heading">
         <div><div className="inline"><h2>{docName(doc)}</h2>
+          {doc.role === "quote" && <Pill value="Supplier quotation" />}
           {doc.status !== "processing" && <Pill value={revisedTo ? "Superseded" : statusLabel[doc.status]} />}</div>
           <p>{doc.name} · {doc.sources.length} {doc.kind === "pdf" ? "pages" : doc.kind === "docx" ? "sections" : "worksheets"}</p>
         </div>
         <button className="button secondary" type="button" onClick={() => manage(doc)}>Manage file</button>
       </div>
       <div className="detail-settings">
+        {doc.role === "quote" && canChangeType(doc) && supplierNameNeeded(doc.supplier) &&
+          <button className="button secondary" type="button" onClick={() => setType(true)}>Add supplier name</button>}
         {doc.role === "bom" ? <div className="inline">
           <span className="muted">Purchase scope</span><Pill value={batch.scope_mode === "unknown" ? "Unset" : `${count} selected`} />
           <button className="button secondary" type="button" disabled={!bom || !procurementRows(bom.lines).length || bom.status === "processing"}
@@ -94,48 +106,25 @@ export function Documents({ batch, update, upload, revise, manage }: {
           <button className="button secondary" type="button" onClick={() => revise(doc)}>Upload revision</button>}
         {(doc.status === "failed" || doc.status === "needs_review" || doc.parser_update_available) &&
           <PendingButton className="button secondary" type="button" disabled={busy !== null} pending={busy === "retry"}
-            pendingLabel="Starting…" icon={<RotateCcw size={15} />} onClick={() => void retryExtraction(false)}>
+            pendingLabel="Starting…" autoFocus={destination?.kind === "retry" && doc.id === destination.document} icon={<RotateCcw size={15} />} onClick={() => void retryExtraction()}>
             {doc.parser_update_available ? "Read PDF again" : "Try reading again"}
           </PendingButton>}
-        {sharingAvailable && (doc.status === "failed" || doc.status === "needs_review") &&
-          <PendingButton className="button secondary" type="button" disabled={busy !== null} pending={busy === "assisted"}
-            pendingLabel="Starting…" onClick={() => void retryExtraction(true)}>Try assisted reading</PendingButton>}
+
       </div>
       {revisedFrom && <p className="notice">Revision of {revisedFrom.name}.</p>}
       {revisedTo && <p className="notice">Superseded by {revisedTo.name}.</p>}
-      {doc.classification && <details className="notice">
-        <summary>{doc.intake === "override" ? "Type corrected by reviewer" : "Classification evidence"}</summary>
-        <p>{documentFeedback(doc.classification.basis)}</p>
-        {doc.classification.evidence?.map((anchor, index) =>
-          <p key={index}>{sourceName(anchor.source)} · {anchor.text}</p>)}
-      </details>}
-      {doc.status !== "processing" && doc.status !== "failed" && doc.role !== "unsupported" && !revisedTo && <details className="notice"
-        open={doc.role === "unknown" || doc.role === "mixed" ? true : undefined}>
-        <summary>Correct type</summary>
-        <form className="stack" key={doc.id} onSubmit={async (event) => {
-          event.preventDefault();
-          const data = new FormData(event.currentTarget);
-          setBusy("type"); setError("");
-          try { update(await api<Batch>(`/documents/${doc.id}/role`, "PATCH", data)); }
-          catch (error) { setError((error as Error).message); }
-          finally { setBusy(null); }
-        }}>
-          <label>Document type<select name="role" defaultValue={doc.role === "quote" ? "quote" : "bom"}>
-            <option value="bom">Bill of materials</option><option value="quote">Supplier quotation</option>
-          </select></label>
-          <label>Supplier name for quotations<input name="supplier" defaultValue={doc.supplier} maxLength={120} /></label>
-          {doc.role === "mixed" && doc.lines.length > 0 && <fieldset className="scope-checks">
-            <legend>Exclude rows from reference sections</legend>
-            {doc.lines.filter((line) => !line.excluded).map((line) => <label key={line.id} className="inline">
-              <input type="checkbox" name="exclude_rows" value={line.id} />
-              {line.id} · {line.fields.material || line.fields.description}
-            </label>)}
-          </fieldset>}
-          <label>Reason for correction<input name="reason" maxLength={500} required /></label>
-          <PendingButton type="submit" className="button secondary" disabled={busy !== null} pending={busy === "type"}
-            pendingLabel="Saving…">Save type correction</PendingButton>
-        </form>
-      </details>}
+      {Boolean(doc.classification?.bundled_offers?.length) && <div className="notice stack">
+        <strong>Separate supplier offers</strong>
+        <p>Download each offer, remove this bundle, and upload the separate files to compare them.</p>
+        {doc.classification?.bundled_offers?.map((offer) => <a className="button secondary" key={offer.pages[0]}
+          href={`/api/documents/${doc.id}/offer/${offer.pages[0]}`}>
+          Download {offer.supplier} · {offer.pages.length === 1 ? `page ${offer.pages[0]}` : `pages ${offer.pages.join(", ")}`}
+        </a>)}
+      </div>}
+      {canChangeType(doc) && (doc.role === "unknown" || doc.role === "mixed") && <div className="notice inline">
+        <span>{doc.role === "mixed" ? "This file contains both requirements and offer details." : "Review how this file should be used."}</span>
+        <button className="button secondary" type="button" onClick={() => setType(true)}>Confirm document type</button>
+      </div>}
       {doc.terms.draft_notice && <p className="notice">Source marked draft or not issued. Confirm figures with the vendor before procurement.</p>}
       {schedules.length > 0 && <details className="notice">
         <summary>{schedules.length} priced {schedules.length === 1 ? "schedule" : "schedules"} · {materialCount} material rows · {doc.lines.length - materialCount} service rows</summary>
@@ -158,8 +147,7 @@ export function Documents({ batch, update, upload, revise, manage }: {
           <button key={value} type="button" aria-pressed={mode === value} onClick={() => setMode(value)}>{label}</button>)}
       </nav>
       {mode === "source" ? <div className="source-single">
-        <div className="source-controls"><Zoom value={zoom} change={setZoom} /></div>
-        <SourceViewer key={doc.id} doc={doc} zoom={zoom} />
+        <SourceViewer key={doc.id} doc={doc} />
       </div> : mode === "terms" ? <>
         <div className="table-heading"><h3>Extracted terms</h3>
           <button className="button secondary" type="button" disabled={!doc.sources.length}
@@ -203,9 +191,66 @@ export function Documents({ batch, update, upload, revise, manage }: {
       </>}
     </section>
     {scope && bom && <ScopeEditor key={batch.id} batch={batch} bom={bom} close={() => setScope(false)} update={update} />}
+    {type && canChangeType(doc) && <TypeEditor doc={doc} update={update} close={() => setType(false)} />}
     {editor && <FieldEditor key={typeof editor === "string" ? editor : editor.id} doc={doc} bom={bom}
-      batch={batch} editor={editor} update={update} close={() => edit(null)} />}
+      batch={batch} editor={editor} context={editorContext} update={update} close={() => { edit(null); setEditorContext(undefined); onEditorClose?.(); }} />}
   </div>;
+}
+
+function TypeEditor({ doc, update, close }: { doc: Document; update: (batch: Batch) => void; close: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [source, setSource] = useState<Anchor>();
+  const uncertain = doc.role === "mixed" || doc.role === "unknown";
+  const evidence = doc.classification?.evidence ?? [];
+  const unnamed = doc.role === "quote" && supplierNameNeeded(doc.supplier);
+  const title = unnamed ? "Add supplier name" : uncertain ? "Confirm document type" : "Change document type";
+
+  return <Modal title={title} close={close} busy={busy} wide={Boolean(source)}>
+    <form className="modal-body stack" onSubmit={async (event) => {
+      event.preventDefault();
+      const data = new FormData(event.currentTarget);
+      setBusy(true); setError("");
+      try {
+        update(await api<Batch>(`/documents/${doc.id}/role`, "PATCH", data));
+        close();
+      } catch (error) { setError((error as Error).message); }
+      finally { setBusy(false); }
+    }}>
+      <p>{doc.name}</p>
+      {doc.classification && <details className="notice" open={uncertain ? true : undefined}>
+        <summary>{doc.intake === "override" ? "Original type assessment" : "Why this type?"}</summary>
+        <p>{documentFeedback(doc.classification.basis)}</p>
+        {evidence.slice(0, 4).map((anchor, index) =>
+          <button className="source-excerpt" type="button" key={index} onClick={() => setSource(anchor)}>
+            <strong>{sourceName(anchor.source)}</strong> {anchor.text}
+          </button>)}
+        {evidence.length > 4 && <details><summary>More excerpts</summary>
+          {evidence.slice(4).map((anchor, index) =>
+            <button className="source-excerpt" type="button" key={index} onClick={() => setSource(anchor)}>
+              <strong>{sourceName(anchor.source)}</strong> {anchor.text}
+            </button>)}
+        </details>}
+      </details>}
+      {source && <SourceViewer key={evidence.indexOf(source)} doc={doc} initial={source.source} anchors={[source]} />}
+      <label>Document type<select name="role" aria-label="Document type" required defaultValue={uncertain ? "" : doc.role}>
+        {uncertain && <option value="" disabled>Choose a type</option>}
+        {!doc.revises && <option value="bom">Bill of materials</option>}
+        <option value="quote">Supplier quotation</option>
+      </select></label>
+      <label>Supplier name for quotations<input name="supplier" defaultValue={unnamed ? "" : doc.supplier || doc.terms.supplier} maxLength={120} /></label>
+      {doc.role === "mixed" && doc.lines.length > 0 && <fieldset className="scope-checks">
+        <legend>Exclude rows from reference sections</legend>
+        {doc.lines.filter((line) => !line.excluded).map((line) => <label key={line.id} className="inline">
+          <input type="checkbox" name="exclude_rows" value={line.id} />
+          {line.id} · {line.fields.material || line.fields.description}
+        </label>)}
+      </fieldset>}
+      <label>Reason for correction<input name="reason" maxLength={500} required /></label>
+      {error && <p className="error" role="alert">{error}</p>}
+      <PendingButton type="submit" className="button primary" pending={busy} pendingLabel="Saving…">Save document type</PendingButton>
+    </form>
+  </Modal>;
 }
 
 function ScopeEditor({ batch, bom, update, close }: {
@@ -253,8 +298,8 @@ function ScopeEditor({ batch, bom, update, close }: {
   </Modal>;
 }
 
-function FieldEditor({ doc, bom, batch, editor, update, close }: {
-  doc: Document; bom?: Document; batch: Batch; editor: Line | "terms" | "new";
+function FieldEditor({ doc, bom, batch, editor, context, update, close }: {
+  doc: Document; bom?: Document; batch: Batch; editor: Line | "terms" | "new"; context?: SourceEditor;
   update: (value: Batch) => void; close: () => void;
 }) {
   const terms = editor === "terms";
@@ -264,7 +309,7 @@ function FieldEditor({ doc, bom, batch, editor, update, close }: {
   const fields = terms ? termFields : lineFields;
   const [values, setValues] = useState<Record<string, string>>(initial);
   const [linked, setLinked] = useState<Record<string, Link>>({});
-  const [field, setField] = useState(Object.keys(fields).find((key) => original[key]) ?? (terms ? "tax" : "material"));
+  const [field, setField] = useState(context?.field ?? Object.keys(fields).find((key) => original[key]) ?? (terms ? "tax" : "material"));
   const [match, setMatch] = useState(line?.match ?? "auto");
   const [factor, setFactor] = useState(line?.factor ?? "");
   const [note, setNote] = useState("");
@@ -273,7 +318,6 @@ function FieldEditor({ doc, bom, batch, editor, update, close }: {
   const [busy, setBusy] = useState(false);
   const [suggestion, setSuggestion] = useState("");
   const [suggesting, setSuggesting] = useState(false);
-  const [zoom, setZoom] = useState(100);
   const anchor: Anchor | undefined = original[field];
   const draft = linked[field];
   const matching = !terms && doc.role === "quote" && Boolean(bom);
@@ -318,15 +362,10 @@ function FieldEditor({ doc, bom, batch, editor, update, close }: {
             {currentMatch?.candidates.length ? <p className="fine-print">Candidates {currentMatch.candidates.join(", ")}</p> : null}
             {line && batch.ai.configured && <PendingButton className="button secondary" type="button"
               pending={suggesting} pendingLabel="Finding matches…" disabled={busy} onClick={async () => {
-              const data = new FormData();
-              if (batch.ai.provider === "gemini") {
-                if (!window.confirm("Allow Google to receive these descriptions to suggest matches? Continue only if they are non-confidential.")) return;
-                data.append("use_gemini", "true");
-              }
               setSuggesting(true);
               try {
                 const result = await api<{ candidates: string[]; message: string }>(
-                  `/documents/${doc.id}/line/${encodeURIComponent(line.id)}/suggest`, "POST", data);
+                  `/documents/${doc.id}/line/${encodeURIComponent(line.id)}/suggest`, "POST");
                 setSuggestion(`${documentFeedback(result.message)} ${result.candidates.join(", ")}`);
               } catch (error) { setSuggestion((error as Error).message); }
               finally { setSuggesting(false); }
@@ -339,9 +378,8 @@ function FieldEditor({ doc, bom, batch, editor, update, close }: {
         <section className="editor-source">
           <div className="evidence-heading"><div><h3>{fields[field]}</h3>
             <p>{doc.kind === "pdf" ? "Drag over the source text to link a region." : "Select a populated cell to link it."}</p></div>
-            <Zoom value={zoom} change={setZoom} />
           </div>
-          <SourceViewer key={field} doc={doc} initial={draft?.source ?? anchor?.source} anchors={anchor ? [anchor] : []} zoom={zoom}
+          <SourceViewer key={field} doc={doc} initial={draft?.source ?? (field === context?.field ? context.source : undefined) ?? anchor?.source} anchors={anchor ? [anchor] : []}
             draft={draft} onLink={(link) => setLinked({ ...linked, [field]: link })} />
           {draft?.box && <label>Original text in marked region<input maxLength={500}
             value={draft.text ?? ""} onChange={(event) => setLinked({ ...linked, [field]: { ...draft, text: event.target.value } })} /></label>}

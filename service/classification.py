@@ -23,7 +23,11 @@ def classify(snapshot):
     terms = {field: a for field, a in snapshot["term_anchors"].items() if field in COMMERCIAL}
     lines = snapshot["lines"]
     summaries = [snapshot["term_anchors"][field] for field in ("materials_total", "total")
-                 if field in snapshot["term_anchors"] and not snapshot["term_anchors"][field].get("weak")
+                 if field in snapshot["term_anchors"] and (
+                     not snapshot["term_anchors"][field].get("weak")
+                     or snapshot["term_anchors"][field].get("method") == "model"
+                     and snapshot.get("provenance", {}).get("provider") == "gemini"
+                 )
                  and re.fullmatch(r"(?:(?:PHP|₱)\s*)?\d[\d,]*(?:\.\d+)?", snapshot["terms"].get(field, ""), re.I)]
     prices = [row["anchors"][field] for row in lines for field in ("unit_price", "amount")
               if row["fields"].get(field) and field in row["anchors"]]
@@ -37,18 +41,28 @@ def classify(snapshot):
                       if OFFER.search(anchor["text"]) or MODEL_OFFER.search(anchor["text"])]
     native_offer_terms = {field for field in OFFER_TERMS & terms.keys() if terms[field].get("method") != "model"}
     estimated = [a for a in headings if re.search(r"\bestimated (?:unit )?(?:cost|price)\b", a["text"], re.I)]
+    groups = {}
+    issuer = ""
+    for source in snapshot.get("sources", []):
+        issuer = source.get("offer_issuer") or issuer
+        if issuer:
+            group = groups.setdefault(" ".join(issuer.casefold().split()), {"supplier": issuer, "pages": []})
+            group["pages"].append(source["ref"])
+    bundled = list(groups.values()) if len(groups) > 1 else []
     if unsupported:
         role, basis, evidence = "unsupported", "Source identifies an unsupported procurement document.", unsupported
+    elif bundled:
+        role, basis = "mixed", "This PDF contains quotations from multiple suppliers. Download each offer separately to compare them."
     elif requirements and (offers or native_offer_terms - {"supplier"}):
         role, basis = "mixed", "Requirements and supplier-offer signals coexist. Inspect the source."
     elif (proposed_bom and (offers or proposed_offer)) or (proposed_offer and requirements):
         role, basis = "mixed", "The local interpretation found conflicting document purposes. Inspect the cited sections."
-    elif lines and (requirements or (estimated and not offers and not native_offer_terms - {"supplier"})):
+    elif lines and (requirements or proposed_bom or (estimated and not offers and not native_offer_terms - {"supplier"})):
         role, basis = "bom", "Requirements or estimated-cost headings identify the material baseline."
-        evidence += estimated
-    elif offers and summaries and not lines:
+        evidence += estimated + proposed_bom
+    elif (offers or proposed_offer) and summaries and not lines:
         role, basis = "quote", "Quotation heading and priced summary are present. The offer is not itemized."
-        evidence += summaries
+        evidence += summaries + proposed_offer
     elif lines and (offers or proposed_offer or (prices and native_offer_terms)):
         role, basis = "quote", "An offer heading or commercial terms accompany the material lines."
         evidence += prices[:3] + proposed_offer
@@ -63,4 +77,4 @@ def classify(snapshot):
     if role in {"unknown", "mixed"}:
         evidence += [anchor for proposal in proposals for anchor in proposal["evidence"]]
     return {"role": role, "basis": basis, "evidence": evidence[:12], "version": "rules-2.2",
-            "summary_only": bool(role == "quote" and not lines and summaries)}
+            "summary_only": bool(role == "quote" and not lines and summaries), "bundled_offers": bundled}

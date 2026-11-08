@@ -1,44 +1,73 @@
 "use client";
 
 import { History, Table2 } from "lucide-react";
-import { amount, documentFeedback, lineFields, procurementRows, reviews, termFields } from "./model";
+import { useState } from "react";
+import { amount, coverageLabel, documentFeedback, lineFields, procurementRows, reviews, supplierNameNeeded, termFields } from "./model";
 import type { Batch } from "./model";
 import { Empty, Pill } from "./shared";
 
-export function SupplierComparison({ batch }: { batch: Batch }) {
+const comparisonViews = ["Overview", "Terms", "Line items"] as const;
+
+export function SupplierComparison({ batch, openFinding }: { batch: Batch; openFinding: (id: string) => void }) {
+  const [view, setView] = useState<typeof comparisonViews[number]>("Overview");
+  const [exceptions, setExceptions] = useState(false);
   if (!batch.comparison.length) return <Empty icon={<Table2 size={25} />} title="No supplier comparison yet">
     <p>Run verification to compare covered materials, costs, and terms.</p>
   </Empty>;
   const suppliers = batch.comparison;
+  const documents = new Map(batch.documents.map((doc) => [doc.id, doc]));
   const bom = batch.documents.find((doc) => doc.role === "bom");
-  const rows = procurementRows(bom?.lines ?? []).filter((line) => batch.scope_mode === "all" ||
-    (batch.scope_mode === "selected" && batch.scope.includes(line.id)));
+  const rows = procurementRows(bom?.lines ?? []).filter((line) =>
+    (batch.scope_mode === "all" || (batch.scope_mode === "selected" && batch.scope.includes(line.id))) &&
+    (!exceptions || suppliers.some((supplier) => supplier.items[line.id]?.state !== "pass"))
+  );
   const summaryTerms = ["materials_total", "labor_equipment", "mobilization", "total", "advance_payment", "balance_payment", "draft_notice"]
     .filter((field) => suppliers.some((row) => row.terms[field]));
   const terms = [...summaryTerms, "quote_date", "reference", "freight", "charges", "discount", "vat", "delivery", "validity", "payment"];
+  const blockers = batch.issues.filter((issue) => issue.severity === "Blocking" && issue.review.status !== "false_positive");
+  const blockerGroups = [
+    { title: "Unresolved blockers", issues: blockers.filter((issue) => issue.review.status !== "confirmed") },
+    { title: "Confirmed blockers", issues: blockers.filter((issue) => issue.review.status === "confirmed") },
+  ];
   return <section className="comparison">
     <div className="detail-heading"><h2>Offer comparison</h2></div>
+    <div className="inline comparison-controls">
+      <nav className="segment" aria-label="Comparison view">{comparisonViews.map((item) =>
+        <button type="button" key={item} aria-pressed={view === item} onClick={() => setView(item)}>{item}</button>)}</nav>
+      {view === "Line items" && <label className="inline">
+        <input type="checkbox" checked={exceptions} onChange={(event) => setExceptions(event.target.checked)} /> Exceptions only
+      </label>}
+    </div>
+    {view === "Line items" && !rows.length ? <Empty icon={<Table2 size={22} />} title={exceptions ? "No line item exceptions" : "No line items in scope"} /> :
     <div className="table-scroll"><table className="data-table matrix">
-      <thead><tr><th scope="col">Comparison basis</th>{suppliers.map((row) => <th scope="col" key={row.document}>{row.supplier}</th>)}</tr></thead>
+      <thead><tr><th scope="col">{view === "Line items" ? "Required material" : "Comparison basis"}</th>{suppliers.map((row) => <th scope="col" key={row.document}>{supplierNameNeeded(row.supplier)
+          ? <>Supplier name needed<small>{documents.get(row.document)?.name}</small></>
+          : row.supplier}</th>)}</tr></thead>
       <tbody>
-        <tr><th scope="row">Comparable total</th>{suppliers.map((row) => <td key={row.document}>
-          {row.total === null ? <><Pill value="Incomparable" /><ul>{row.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul></>
-            : <strong className="total-amount">{amount(row.total, row.currency)}</strong>}
-        </td>)}</tr>
-        <tr><th scope="row">Declared coverage</th>{suppliers.map((row) => <td key={row.document}>{row.coverage}</td>)}</tr>
-        <tr><th scope="row">VAT basis</th>{suppliers.map((row) => <td key={row.document}>{row.tax_basis}</td>)}</tr>
-        <tr><th scope="row">Line sum / stated subtotal</th>{suppliers.map((row) => <td key={row.document}>
-          {amount(row.line_sum, row.currency)} / {amount(row.subtotal, row.currency)}</td>)}</tr>
-        {terms.map((field) => <tr key={field}><th scope="row">{termFields[field]}</th>
-          {suppliers.map((row) => <td key={row.document}>{row.terms[field] || "Unknown"}</td>)}</tr>)}
-        <tr><th scope="row">Outstanding findings</th>{suppliers.map((row) => {
-          const issues = batch.issues.filter((issue) => issue.evidence.some((anchor) => anchor.document === row.document) &&
-            issue.review.status !== "false_positive");
-          return <td key={row.document}>{issues.length ? <ul>{issues.map((issue) =>
-            <li key={issue.id}>{issue.title} · {reviews[issue.review.status]}</li>)}</ul> : "None"}</td>;
-        })}</tr>
-        {rows.length > 0 && <tr className="matrix-section"><th colSpan={suppliers.length + 1}>Purchase scope ({rows.length} materials)</th></tr>}
-        {rows.map((line) => <tr key={line.id}><th scope="row">
+        {view === "Overview" && <>
+          <tr><th scope="row">Comparable total</th>{suppliers.map((row) => <td key={row.document}>
+            {row.total === null ? <><Pill value="Incomparable" /><details className="comparison-reasons">
+              <summary>Why this offer is incomparable</summary>
+              <ul>{row.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>
+            </details></> : <strong className="total-amount">{amount(row.total, row.currency)}</strong>}
+          </td>)}</tr>
+          <tr><th scope="row">Declared coverage</th>{suppliers.map((row) => <td key={row.document}>{coverageLabel[row.coverage]}</td>)}</tr>
+          {blockerGroups.filter((group, index) => index === 0 || group.issues.length > 0).map((group) =>
+            <tr key={group.title}><th scope="row">{group.title}</th>{suppliers.map((row) => {
+              const issues = group.issues.filter((issue) => issue.evidence.some((anchor) => anchor.document === row.document));
+              return <td key={row.document}>{issues.length ? <ul className="comparison-findings">{issues.map((issue) =>
+                <li key={issue.id}><button className="text-button" type="button" onClick={() => openFinding(issue.id)}>
+                  {issue.title}</button><small>{reviews[issue.review.status]}</small></li>)}</ul> : "None"}</td>;
+            })}</tr>)}
+        </>}
+        {view === "Terms" && <>
+          <tr><th scope="row">VAT basis</th>{suppliers.map((row) => <td key={row.document}>{row.tax_basis}</td>)}</tr>
+          <tr><th scope="row">Line sum / stated subtotal</th>{suppliers.map((row) => <td key={row.document}>
+            {amount(row.line_sum, row.currency)} / {amount(row.subtotal, row.currency)}</td>)}</tr>
+          {terms.map((field) => <tr key={field}><th scope="row">{termFields[field]}</th>
+            {suppliers.map((row) => <td key={row.document}>{row.terms[field] || "Unknown"}</td>)}</tr>)}
+        </>}
+        {view === "Line items" && rows.map((line) => <tr key={line.id}><th scope="row">
           {line.fields.material || line.fields.description}<small>{line.fields.code || line.id} · Required {line.fields.quantity || "—"} {line.fields.unit}</small>
         </th>{suppliers.map((row) => {
           const item = row.items[line.id];
@@ -49,7 +78,7 @@ export function SupplierComparison({ batch }: { batch: Batch }) {
             </div>)}</td>;
         })}</tr>)}
       </tbody>
-    </table></div>
+    </table></div>}
   </section>;
 }
 
