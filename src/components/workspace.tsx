@@ -137,7 +137,7 @@ export function Workspace() {
 
   const blocked = active?.issues.filter((issue) => issue.severity === "Blocking").length ?? 0;
   const warnings = active?.issues.filter((issue) => issue.severity === "Warning").length ?? 0;
-  const quotes = active?.documents.filter((doc) => doc.role === "quote" && !doc.superseded_by).length ?? 0;
+  const quotes = active?.documents.filter((doc) => doc.role === "quote" && !doc.superseded_by && doc.bundle_active !== false).length ?? 0;
   const canVerify = Boolean(active && !active.verification_problem);
   const verified = Boolean(active?.verified_at && !active.stale);
 
@@ -202,11 +202,12 @@ export function Workspace() {
               <div className="batch-stats">
                 <div><span>Source files</span><strong>{active.documents.length}</strong><small>{quotes} supplier {quotes === 1 ? "offer" : "offers"}</small></div>
                 <div><span>Findings</span><strong>{verified ? active.issues.length : "—"}</strong><small>{verified ? `${blocked} blocking · ${warnings} warnings` : "Awaiting verification"}</small></div>
-                <div><span>Purchase scope</span><strong className="stat-label">{active.scope_mode === "unknown" ? "Unset" : active.scope_mode === "all" ? "All BOM items" : `${active.scope.length} selected`}</strong>
-                  <small>{active.scope_mode === "unknown" ? "Set from the BOM preview" : "Applied to coverage checks"}</small></div>
+                <div><span>Purchase scope</span><strong className="stat-label">{active.scope_mode === "unknown" ? "Unset" : active.scope_mode === "all" ? "All material items" : `${active.scope.length} selected`}</strong>
+                  <small>{active.scope_mode === "unknown" ? "Set from the BOM or BOQ" : "Applied to coverage checks"}</small></div>
                 <div><span>Verification</span><strong className="stat-label">{working ? "Checking" : processing ? "Waiting for files" : verified ? "Verified" : active.stale ? "Out of date" : "Not run"}</strong>
-                  <small>{verified && active.verified_at ? new Date(active.verified_at).toLocaleString("en-PH") : active.stale ? "Run verification again" : "Checks against purchase scope"}</small></div>
+                  <small>{verified && active.verified_at ? new Date(active.verified_at).toLocaleString("en-PH", { timeZone: "Asia/Manila" }) : active.stale ? "Run verification again" : "Checks against purchase scope"}</small></div>
               </div>
+              {active.verification_update_available && <p className="notice">This saved result uses earlier verification rules. Run verification again to apply the current rules.</p>}
             </header>
             <section className="panel workspace-panel">
               <div className="viewbar">
@@ -265,7 +266,7 @@ export function Workspace() {
         openBatch(current?.batches[0]?.id ?? "", active.project);
       }} deletion="Delete batch and its source files" />}
     {dialog?.kind === "manageFile" && <NameDialog title="Manage source file" initial={dialog.doc.name}
-      close={() => setDialog(null)} remove={async () => {
+      close={() => setDialog(null)} remove={dialog.doc.bundle_parent ? undefined : async () => {
         accept(await api<Batch>(`/documents/${dialog.doc.id}`, "DELETE"));
       }} deletion="Remove source from this batch"
       extra={canChangeType(dialog.doc) && <button className="button secondary" type="button" onClick={() => {
@@ -329,7 +330,7 @@ function UploadDialog({ batch, revises, update, close }: {
   const [files, setFiles] = useState<File[]>([]);
   const [uploaded, setUploaded] = useState(0);
   const hostedReading = batch.ai.provider === "gemini" && batch.ai.configured;
-  return <Modal title={revises ? "Upload revised quotation" : "Add BOM and supplier quotation files"} close={close} busy={busy}>
+  return <Modal title={revises ? "Upload revised quotation" : "Add purchase and quotation files"} close={close} busy={busy}>
     <form className="modal-body stack" onSubmit={async (event) => {
       event.preventDefault(); setBusy(true); setUploaded(0); setError("");
       const failures: string[] = [];
@@ -349,7 +350,7 @@ function UploadDialog({ batch, revises, update, close }: {
       finally { setBusy(false); }
     }}>
       <p>{revises ? `Revision of ${revises.name}. The original stays available in this batch.` :
-        "Add the bill of materials and supplier quotations for this purchase."}</p>
+        "Add the BOM or BOQ, supplier quotations, and any documented buyer requirements."}</p>
       <label className="file-field" onDragOver={(event) => event.preventDefault()} onDrop={(event) => {
         event.preventDefault();
         if (!busy) setFiles(Array.from(event.dataTransfer.files).slice(0, revises ? 1 : undefined));

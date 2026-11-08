@@ -117,19 +117,17 @@ def test_quotation_bundle_keeps_each_supplier_pdf_separate(tmp_path, monkeypatch
         batch = create(client)
         key = ok(client.post(f"/batches/{batch}/documents", files={"file": ("bundle.pdf", output.getvalue())}))["id"]
         view = ok(client.get(f"/batches/{batch}"))
-        doc, = view["documents"]
-        assert doc["role"] == "mixed"
-        assert doc["classification"]["bundled_offers"] == [
-            {"supplier": "Northside Electric", "pages": [1]},
-            {"supplier": "Southside Electric", "pages": [2]},
+        doc = next(item for item in view["documents"] if item["id"] == key)
+        assert doc["role"] == "bundle"
+        assert doc["bundle"]["offers"] == [
+            {"supplier": "Northside Electric", "reference": "", "pages": [1]},
+            {"supplier": "Southside Electric", "reference": "", "pages": [2]},
         ]
         assert client.patch(f"/documents/{key}/role", data={
             "role": "quote", "supplier": "Northside Electric", "reason": "Attempt to merge offers",
         }).status_code == 422
         offer = client.get(f"/documents/{key}/offer/2")
         assert offer.is_success and offer.content.startswith(b"%PDF")
-        separate = ok(client.post(f"/batches/{batch}/documents", files={"file": ("southside.pdf", offer.content)}))["id"]
-        view = ok(client.get(f"/batches/{batch}"))
-        quote = next(doc for doc in view["documents"] if doc["id"] == separate)
+        quote = next(item for item in view["documents"] if item["bundle_parent"] == key and item["bundle_pages"] == [2])
         assert quote["supplier"] == "Southside Electric" and quote["summary_only"]
         assert quote["terms"]["total"] == "PHP 2,000.00"

@@ -44,6 +44,11 @@ CREATE TABLE IF NOT EXISTS audit (
     id INTEGER PRIMARY KEY, batch TEXT, action TEXT NOT NULL, actor TEXT NOT NULL DEFAULT 'Local operator',
     created TEXT NOT NULL, data TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS bundle_versions (
+    parent TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL, created TEXT NOT NULL, content TEXT NOT NULL,
+    PRIMARY KEY(parent, revision)
+);
 """
 
 
@@ -64,9 +69,18 @@ class Store:
                 "intake": "TEXT NOT NULL DEFAULT 'legacy'",
                 "revises": "TEXT REFERENCES documents(id) ON DELETE SET NULL",
                 "processing_step": "TEXT NOT NULL DEFAULT ''",
+                "bundle_parent": "TEXT REFERENCES documents(id) ON DELETE CASCADE",
+                "bundle_pages": "TEXT NOT NULL DEFAULT '[]'",
+                "bundle_active": "INTEGER NOT NULL DEFAULT 1",
             }.items():
                 if column not in columns:
                     db.execute(f"ALTER TABLE documents ADD COLUMN {column} {declaration}")
+            if not any(row["name"] == "baseline_document" for row in db.execute("PRAGMA table_info(batches)")):
+                db.execute("ALTER TABLE batches ADD COLUMN baseline_document TEXT")
+                db.execute("""UPDATE overlays SET changes = json_set(changes, '$.match_baseline', (
+                    SELECT b.id FROM documents d JOIN documents b ON b.batch = d.batch
+                    WHERE d.id = overlays.document AND b.role = 'bom' LIMIT 1
+                )) WHERE json_type(changes, '$.match') IS NOT NULL OR json_type(changes, '$.factor') IS NOT NULL""")
 
     @contextmanager
     def connection(self, write=False, initialize=False):
@@ -118,13 +132,16 @@ def apply_overlay(document, target, changes):
         document["lines"].append(line)
     if line is not None:
         apply_fields(line["fields"], line["anchors"], changes)
-        line.update({key: changes[key] for key in ("match", "factor", "excluded") if key in changes})
+        line.update({key: changes[key] for key in ("match", "factor", "excluded", "match_baseline", "baseline_overrides")
+                     if key in changes})
 
 
 def documents(db, batch):
     rows = db.execute("""
         SELECT d.id, d.batch, d.role, d.name, d.kind, d.supplier, d.coverage, d.digest,
                d.status, d.error, d.intake, d.revises, d.processing_step,
+               d.bundle_parent, d.bundle_pages, d.bundle_active,
+               (SELECT content FROM bundle_versions WHERE parent = d.id ORDER BY revision DESC LIMIT 1) AS bundle,
                d.snapshot_id, s.content, s.created AS extracted_at
         FROM documents d LEFT JOIN snapshots s ON s.id = d.snapshot_id
         WHERE d.batch = ? ORDER BY d.role, d.rowid
@@ -133,17 +150,32 @@ def documents(db, batch):
     for row in rows:
         doc = dict(row)
         stored = doc.pop("content")
+        doc["bundle_pages"] = json.loads(doc["bundle_pages"])
+        doc["bundle_active"] = bool(doc["bundle_active"])
+        doc["bundle"] = json.loads(doc["bundle"]) if doc["bundle"] else None
         doc.update(json.loads(stored) if stored else {
             "sources": [], "lines": [], "terms": {}, "term_anchors": {}, "term_mentions": {}
         })
+        doc.pop("bundle_candidate", None)
+        doc.pop("bundle_headings", None)
+        if doc["bundle"]:
+            doc.update(lines=[], terms={}, term_anchors={}, term_mentions={})
         for overlay in db.execute("SELECT target, changes FROM overlays WHERE document = ?", (doc["id"],)):
             apply_overlay(doc, overlay["target"], json.loads(overlay["changes"]))
         if doc["role"] == "quote" and doc["intake"] == "auto" and doc["terms"].get("supplier"):
             doc["supplier"] = doc["terms"]["supplier"]
         docs.append(doc)
+    from service.boq import is_boq, is_bundled_work
     from service.verification import summary_quote
 
+    for doc in docs:
+        if is_boq(doc):
+            for line in doc["lines"]:
+                if line.get("kind") != "service" and is_bundled_work(line):
+                    line["kind"] = "work"
+
     superseded = {doc["revises"]: doc["id"] for doc in docs if doc["revises"] and doc["role"] == "quote"
+                  and doc["bundle_active"]
                   and doc["status"] in {"ready", "needs_review"}
                   and (any(not line.get("excluded") for line in doc["lines"]) or summary_quote(doc))}
     for doc in docs:

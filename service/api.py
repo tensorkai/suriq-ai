@@ -16,11 +16,15 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from service.boq import is_boq, material_line
+from service.bundles import BundleError, available_slots, compare_references, current_layout, extract_pages, save_layout
+from service.classification import BASELINE_ROLES
 from service.inference import provider, public_status
 from service.extraction import (
     LINE_FIELDS, PARSER_VERSION, TERM_FIELDS, ExtractionError, extract, render_docx, render_page, run_command, validate_file,
 )
 from service.reports import report
+from service.presentation import add_presentation
 from service.store import Store, apply_overlay, attach_reviews, documents, event, now
 from service.suggestions import suggest
 from service.verification import decimal_value, one_schedule, schedule_baseline, summary_quote, verify
@@ -32,7 +36,8 @@ Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max
 Value = Annotated[str, StringConstraints(strip_whitespace=True, max_length=500)]
 Key = Annotated[str, StringConstraints(max_length=100)]
 Coverage = Literal["full", "partial", "unknown"]
-Role = Literal["bom", "quote"]
+Role = Literal["bom", "boq", "quote", "buyer"]
+VERIFICATION_RULES = "verification-3.0"
 
 
 class Input(BaseModel):
@@ -46,6 +51,7 @@ class Named(Input):
 class Scope(Input):
     mode: Literal["unknown", "all", "selected"]
     rows: list[Key] = Field(default_factory=list, max_length=1000)
+    baseline: Key | None = None
 
 
 class SourceLink(Input):
@@ -70,6 +76,26 @@ class SourceSearch(Input):
 
 class QuoteCoverage(Input):
     coverage: Coverage
+
+
+class BundleOffer(Input):
+    supplier: Name
+    reference: Annotated[str, StringConstraints(strip_whitespace=True, max_length=120)] = ""
+    pages: list[int] = Field(min_length=1, max_length=250)
+
+
+class ExcludedPage(Input):
+    page: int
+    reason: Value
+
+
+class BundleChange(Input):
+    revision: int = Field(ge=1)
+    offers: list[BundleOffer] = Field(default_factory=list, max_length=5)
+    reference_pages: list[int] = Field(default_factory=list, max_length=250)
+    excluded: list[ExcludedPage] = Field(default_factory=list, max_length=250)
+    confirm_archive: bool = False
+    undo: bool = False
 
 
 class Review(Input):
@@ -97,22 +123,30 @@ def load_batch(db, batch):
     data["project_name"] = get_row(db, "projects", data["project"], "name")["name"]
     data["ai"] = public_status()
     data["documents"] = documents(db, batch)
+    baselines = [doc for doc in data["documents"] if doc["role"] in BASELINE_ROLES and not doc["superseded_by"]]
+    if data["baseline_document"] not in {doc["id"] for doc in baselines}:
+        data["baseline_document"] = baselines[0]["id"] if len(baselines) == 1 else None
     for doc in data["documents"]:
+        if doc["role"] == "quote":
+            doc["lines"] = [with_baseline_match(line, data["baseline_document"]) for line in doc["lines"]]
         doc.pop("ocr_search", None)
         doc["summary_only"] = summary_quote(doc)
         doc["parser_update_available"] = (
-            doc["kind"] == "pdf" and doc["status"] == "ready"
+            doc["status"] in {"ready", "needs_review"}
             and doc.get("provenance", {}).get("parser") != PARSER_VERSION
             and not db.execute("SELECT 1 FROM overlays WHERE document = ?", (doc["id"],)).fetchone()
         )
     data["verification_problem"], data["verification_action"] = verification_problem(
-        active_documents(data["documents"]), data["scope_mode"], data["scope"]
+        active_documents(data["documents"], data["baseline_document"]), data["scope_mode"], data["scope"]
     )
     data.update(json.loads(stored) if stored and not data["stale"] else {
         "issues": [], "comparison": [], "matches": {},
     })
+    data["verification_update_available"] = bool(stored and not data["stale"]
+                                                and data.get("rule_version") != VERIFICATION_RULES)
     attach_reviews(db, batch, data["issues"])
-    add_review_context(data["issues"], data["documents"], data["matches"])
+    add_review_context(data["issues"], data["documents"], data["matches"], data["baseline_document"])
+    add_presentation(data)
     data["history"] = [
         {**dict(row), "data": json.loads(row["data"])} for row in db.execute("""
             SELECT id, action, actor, created, data FROM audit WHERE batch = ? ORDER BY id DESC LIMIT 150
@@ -121,14 +155,33 @@ def load_batch(db, batch):
     return data
 
 
-def active_documents(docs):
-    return [{**doc, "has_excluded_rows": any(line.get("excluded") for line in doc["lines"]),
-             "lines": [line for line in doc["lines"] if not line.get("excluded") and line.get("kind") != "service"]}
-            for doc in docs if not doc["superseded_by"]]
+def with_baseline_match(line, baseline):
+    scoped = line.get("baseline_overrides", {})
+    if not scoped and (not line.get("match_baseline") or line["match_baseline"] == baseline):
+        return line
+    return {**{key: value for key, value in line.items() if key not in {"match", "factor", "match_baseline", "baseline_overrides"}},
+            **scoped.get(baseline, {})}
+
+
+def active_documents(docs, baseline=None):
+    current = [doc for doc in docs if not doc["superseded_by"] and doc.get("bundle_active", True)]
+    baselines = [doc["id"] for doc in current if doc["role"] in BASELINE_ROLES]
+    baseline = baseline if baseline in baselines else baselines[0] if len(baselines) == 1 else None
+    active = []
+    for doc in current:
+        if baseline and doc["role"] in BASELINE_ROLES and doc["id"] != baseline:
+            continue
+        lines = [material_line(line) if is_boq(doc) else line for line in doc["lines"]
+                 if not line.get("excluded") and line.get("kind") not in {"service", "work"}]
+        if doc["role"] == "quote":
+            lines = [with_baseline_match(line, baseline) for line in lines]
+        active.append({**doc, "has_excluded_rows": any(line.get("excluded") or line.get("kind") == "work" for line in doc["lines"]),
+                       "work_lines": [line for line in doc["lines"] if line.get("kind") == "work"], "lines": lines})
+    return active
 
 
 def verification_problem(docs, scope_mode, scope):
-    boms = [doc for doc in docs if doc["role"] == "bom"]
+    boms = [doc for doc in docs if doc["role"] in BASELINE_ROLES]
     quotes = [doc for doc in docs if doc["role"] == "quote"]
     if any(doc["status"] == "processing" for doc in docs):
         return "Wait for the remaining documents to finish reading.", None
@@ -136,24 +189,31 @@ def verification_problem(docs, scope_mode, scope):
         return "A file could not be read. Try reading it again.", {"kind": "retry", "document": failed["id"]}
     if unsupported := next((doc for doc in docs if doc["role"] == "unsupported"), None):
         return "Remove unsupported procurement documents from this batch.", {"kind": "manage", "document": unsupported["id"]}
-    if bundle := next((doc for doc in docs if doc.get("classification", {}).get("bundled_offers")), None):
-        return "Download the separate supplier offers, remove the bundle, and upload the individual PDFs.", {
-            "kind": "read", "document": bundle["id"],
+    if bundle := next((doc for doc in docs if doc.get("bundle") and
+                       (doc["bundle"]["pending_pages"] or doc["bundle"]["reason"])), None):
+        return (bundle["bundle"]["reason"] or "Resolve unassigned quotation bundle pages before verification.",
+                {"kind": "read", "document": bundle["id"]})
+    if bundle := next((doc for doc in docs if not doc.get("bundle") and
+                       doc.get("classification", {}).get("bundled_offers")), None):
+        return "Read this quotation bundle again to assign its pages in the workspace.", {
+            "kind": "retry", "document": bundle["id"],
         }
     if revision := next((doc for doc in docs if doc["revises"] and doc["role"] != "quote"), None):
         return "A revised offer must be classified as a quotation.", {"kind": "type", "document": revision["id"]}
-    if unclear := next((doc for doc in docs if doc["role"] not in {"bom", "quote"}), None):
+    if unclear := next((doc for doc in docs if doc["role"] not in BASELINE_ROLES | {"quote", "buyer", "bundle", "reference"}), None):
         return "Confirm unknown or mixed document types before verification.", {"kind": "type", "document": unclear["id"]}
     if len(boms) > 1:
+        if any(doc["role"] == "boq" for doc in boms):
+            return "Choose which BOM or BOQ is the baseline for this purchase.", {"kind": "scope", "document": boms[0]["id"]}
         return ("Multiple BOMs detected. Use one baseline BOM per batch and keep different project sites in separate batches.",
                 {"kind": "manage", "document": boms[1]["id"]})
     if len(boms) != 1 or not quotes:
-        return "Verification requires one BOM and one to five quotations.", {"kind": "upload"}
+        return "Verification requires one BOM or BOQ and one to five quotations.", {"kind": "upload"}
     if len(quotes) > 5:
         return "Verification requires at most five quotations.", {"kind": "manage", "document": quotes[5]["id"]}
     if empty := next((doc for doc in [*boms, *quotes] if not doc["lines"]
-                      and (doc["role"] == "bom" or (doc["intake"] != "legacy" and not summary_quote(doc)))), None):
-        return ("The BOM needs material rows. Each quote needs itemized rows or a priced summary.",
+                      and (doc["role"] in BASELINE_ROLES or (doc["intake"] != "legacy" and not summary_quote(doc)))), None):
+        return ("The purchase baseline needs material rows. Each quote needs itemized rows or a priced summary.",
                 {"kind": "read", "document": empty["id"]})
     baseline = {line["id"] for line in boms[0]["lines"]}
     if scope_mode == "unknown" or (scope_mode == "selected" and (not scope or set(scope) - baseline)):
@@ -163,11 +223,11 @@ def verification_problem(docs, scope_mode, scope):
     return "", None
 
 
-def add_review_context(issues, docs, matches):
+def add_review_context(issues, docs, matches, selected_baseline=None):
     # Derive viewer metadata on read so saved reviews retain their evidence fingerprints.
     if not issues:
         return
-    baseline = {line["id"]: line["fields"] for doc in docs if doc["role"] == "bom" for line in doc["lines"]}
+    baseline = {line["id"]: line["fields"] for doc in docs if doc["id"] == selected_baseline for line in doc["lines"]}
     fields = {(doc["id"], line["id"]): line["fields"] for doc in docs for line in doc["lines"]}
     quotes = {doc["id"] for doc in docs if doc["role"] == "quote"}
     for issue in issues:
@@ -179,12 +239,12 @@ def add_review_context(issues, docs, matches):
         if rule == "missing" and isinstance(subject, str) and subject in baseline:
             row = baseline[subject]
             issue["search_hint"] = row.get("code") or row.get("material") or row.get("description", "")
-        if rule == "charges" and isinstance(subject, list) and condition in {"freight", "charges", "discount"}:
+        if rule == "charges" and not issue.get("source_editors") and isinstance(subject, list) and condition in {"freight", "charges", "discount"}:
             issue["source_editors"] = [{"document": subject[0], "target": "terms", "field": condition}]
-        if rule == "tax" and condition in {"unknown", "VAT exclusive"}:
+        if rule == "tax" and not issue.get("source_editors") and condition in {"unknown", "VAT exclusive"}:
             issue["source_editors"] = [{"document": subject, "target": "terms",
                                         "field": "tax" if condition == "unknown" else "vat"}]
-        if rule == "delivery" and issue["review_required"]:
+        if rule == "delivery" and issue["review_required"] and not issue.get("source_editors"):
             offer_ids = {anchor["document"] for anchor in issue["evidence"]} & quotes
             if subject == "batch":
                 editors = [{"document": key, "target": "terms", "field": "delivery"} for key in sorted(offer_ids)]
@@ -207,19 +267,27 @@ def rerun(db, batch, *, explicit=False):
     batch_row = get_row(db, "batches", batch)
     if not explicit and not batch_row["verified_at"]:
         return
-    docs = active_documents(documents(db, batch))
+    docs = active_documents(documents(db, batch), batch_row["baseline_document"])
     problem, _ = verification_problem(docs, batch_row["scope_mode"], json.loads(batch_row["scope"]))
     if problem:
         if explicit:
             fail(409, problem)
         db.execute("UPDATE batches SET stale = 1 WHERE id = ?", (batch,))
         return
-    result = verify(docs, batch_row["scope_mode"], json.loads(batch_row["scope"]))
-    payload, stamp = json.dumps(result), now()
-    sources = [{key: doc[key] for key in ("id", "snapshot_id", "role", "coverage")} for doc in docs]
+    stamp = now()
+    result = verify([doc for doc in docs if doc["role"] != "bundle"],
+                    batch_row["scope_mode"], json.loads(batch_row["scope"]), as_of=stamp)
+    result["reference_links"], reference_issues = compare_references(docs)
+    result["issues"].extend(reference_issues)
+    result["rule_version"] = VERIFICATION_RULES
+    payload = json.dumps(result)
+    sources = [{key: doc[key] for key in ("id", "snapshot_id", "role", "coverage", "bundle_parent", "bundle_pages")
+                if key in doc} | ({"bundle_revision": doc["bundle"]["revision"]} if doc.get("bundle") else {}) for doc in docs]
     db.execute("INSERT INTO verification_runs (batch, created, inputs, result) VALUES (?, ?, ?, ?)", (
         batch, stamp, json.dumps({
             "scope_mode": batch_row["scope_mode"], "scope": json.loads(batch_row["scope"]),
+            "baseline_document": next((doc["id"] for doc in docs if doc["role"] in BASELINE_ROLES), None),
+            "rule_version": VERIFICATION_RULES, "as_of": stamp,
             "documents": sources,
             "last_event": db.execute("SELECT MAX(id) FROM audit WHERE batch = ?", (batch,)).fetchone()[0],
         }), payload,
@@ -227,10 +295,9 @@ def rerun(db, batch, *, explicit=False):
     db.execute("UPDATE batches SET result = ?, verified_at = ?, stale = 0 WHERE id = ?", (payload, stamp, batch))
 
 
-def clear_baseline_selection(db, batch):
-    db.execute("UPDATE batches SET scope_mode = 'unknown', scope = '[]' WHERE id = ?", (batch,))
-    db.execute("""UPDATE overlays SET changes = json_remove(changes, '$.match', '$.factor')
-        WHERE document IN (SELECT id FROM documents WHERE batch = ?)""", (batch,))
+def clear_baseline_selection(db, batch, *, baseline=None):
+    db.execute("UPDATE batches SET scope_mode = 'unknown', scope = '[]', baseline_document = ? WHERE id = ?",
+               (baseline, batch))
 
 
 def link_anchor(doc, link):
@@ -286,7 +353,8 @@ def create_app(path):
 
     def process_source(doc_id):
         with store.connection() as db:
-            doc = db.execute("SELECT original, kind, batch, role, intake, supplier FROM documents WHERE id = ?", (doc_id,)).fetchone()
+            doc = db.execute("""SELECT id, original, kind, batch, role, intake, supplier, revises
+                FROM documents WHERE id = ?""", (doc_id,)).fetchone()
         if doc is None:
             return
         try:
@@ -298,7 +366,9 @@ def create_app(path):
             snapshot = extract(doc["original"], doc["kind"], on_inference=interpreting)
             classification = snapshot["classification"]
             error = snapshot["provenance"].get("message", "")
-            if not snapshot["lines"] and not classification.get("summary_only"):
+            if (not snapshot["lines"] and not classification.get("summary_only")
+                    and "buyer" not in {doc["role"], classification["role"]}
+                    and classification["role"] not in {"bundle", "reference"}):
                 error = error or "No structured rows recognized. Link and enter rows from the source."
             role_review = (classification["role"] in {"mixed", "unsupported"} and doc["intake"] != "override"
                            or doc["intake"] == "auto" and classification["role"] == "unknown")
@@ -317,13 +387,38 @@ def create_app(path):
             if current is None:
                 return
             snapshot_id = current["snapshot_id"]
+            layout = None
+            if (snapshot is not None and not doc["revises"] and doc["intake"] in {"auto", "legacy"}
+                    and doc["role"] not in BASELINE_ROLES | {"buyer"}):
+                previous = current_layout(db, doc_id)
+                candidate = snapshot.get("bundle_candidate")
+                layout = (candidate if previous and previous["pending_pages"] and not previous.get("manual")
+                          else previous) or candidate or previous
+                if layout is not None:
+                    layout = {**layout, "reason": ""}
+                    if not layout["pending_pages"] and len(layout["offers"]) > available_slots(db, doc_id, doc["batch"]):
+                        layout["reason"] = "Choose the active offers in this bundle. The batch can include at most five."
+                    db.execute("SAVEPOINT materialize_bundle")
+                    try:
+                        layout = save_layout(db, doc, snapshot, layout, record=layout != previous)
+                    except BundleError as exc:
+                        db.execute("ROLLBACK TO materialize_bundle")
+                        if previous:
+                            snapshot, layout, status, error = None, previous, "needs_review", str(exc)
+                        else:
+                            layout = save_layout(db, doc, snapshot, {**layout, "reason": str(exc)})
+                    finally:
+                        db.execute("RELEASE materialize_bundle")
+                    if snapshot is not None:
+                        error = layout["reason"] or ("Assign every page of this bundle." if layout["pending_pages"] else "")
+                        status = "needs_review" if error else "ready"
             if snapshot is not None:
                 snapshot_id = db.execute("INSERT INTO snapshots (document, created, content) VALUES (?, ?, ?)",
                                          (doc_id, now(), json.dumps(snapshot))).lastrowid
             elif snapshot_id:
                 status = "needs_review"
-            if snapshot is not None and (doc["intake"] == "auto" or role_review):
-                role = snapshot["classification"]["role"]
+            if snapshot is not None and (layout or doc["intake"] == "auto" or role_review):
+                role = "bundle" if layout else snapshot["classification"]["role"]
                 supplier = snapshot["terms"].get("supplier", "") if role == "quote" else ""
                 db.execute("UPDATE documents SET role = ?, supplier = ? WHERE id = ?",
                            (role, supplier or ("Unidentified supplier " + doc_id[:6] if role == "quote" else ""), doc_id))
@@ -448,14 +543,14 @@ def create_app(path):
                 predecessor = next((doc for doc in active if doc["id"] == revises and doc["role"] == "quote"), None)
                 if not predecessor or any(doc["revises"] == revises for doc in current):
                     fail(409, "Select a current quotation without an existing revision.")
-                if role == "bom":
+                if role and role != "quote":
                     fail(422, "A quotation revision must also be a quotation.")
-            elif len(active) >= 6 and not role:
-                fail(409, "The batch has six source files. Resolve a conflict or upload a quotation revision.")
+            elif len(active) >= 20:
+                fail(409, "Resolve or remove an imported source before adding more files.")
             if any(doc["digest"] == digest for doc in current):
                 fail(409, "This original file has already been imported into the batch.")
-            if role == "bom" and any(doc["role"] == "bom" for doc in current):
-                fail(409, "A batch accepts exactly one BOM.")
+            if role in BASELINE_ROLES and any(doc["role"] == role for doc in current):
+                fail(409, f"A batch accepts only one explicitly assigned {role.upper()}.")
             if role == "quote" and sum(doc["role"] == "quote" for doc in active) >= 5 and not revises:
                 fail(409, "A batch accepts at most five quotations.")
             db.execute("""INSERT INTO documents
@@ -479,8 +574,10 @@ def create_app(path):
             if not reason.strip():
                 fail(422, "Explain why the document type is being corrected.")
             current = next(row for row in documents(db, doc["batch"]) if row["id"] == key)
-            if current.get("classification", {}).get("bundled_offers"):
-                fail(422, "Download the separate offers before assigning a quotation type.")
+            if current.get("bundle") or current.get("classification", {}).get("bundled_offers"):
+                fail(422, "Assign document pages in the quotation bundle editor.")
+            if current.get("bundle_parent") and (role != "quote" or not current["bundle_active"]):
+                fail(422, "Change page assignments in the quotation bundle editor.")
             if doc["role"] == "unsupported":
                 fail(422, "Remove unsupported procurement documents from the batch.")
             if doc["revises"] and role != "quote":
@@ -499,8 +596,10 @@ def create_app(path):
                     """, [(key, row) for row in sorted(set(exclude_rows))])
             db.execute("UPDATE documents SET role = ?, supplier = ?, intake = 'override' WHERE id = ?",
                        (role, supplier.strip() if role == "quote" else "", key))
-            if doc["role"] != role and "bom" in {doc["role"], role}:
-                clear_baseline_selection(db, doc["batch"])
+            if doc["role"] != role and {doc["role"], role} & BASELINE_ROLES:
+                selected = get_row(db, "batches", doc["batch"], "baseline_document")["baseline_document"]
+                if not selected or selected == key:
+                    clear_baseline_selection(db, doc["batch"], baseline=key if role in BASELINE_ROLES else None)
             event(db, doc["batch"], "correct_role", {"document": key, "before": doc["role"], "after": role,
                                                      "previous_supplier": doc["supplier"],
                                                      "supplier": supplier.strip() if role == "quote" else "",
@@ -508,15 +607,67 @@ def create_app(path):
             rerun(db, doc["batch"])
             return load_batch(db, doc["batch"])
 
+    @app.patch("/documents/{key}/bundle")
+    def correct_bundle(key: str, change: BundleChange):
+        with store.connection(write=True) as db:
+            doc = get_row(db, "documents", key)
+            current = current_layout(db, key)
+            if not current or doc["role"] != "bundle":
+                fail(404, "This document has no quotation bundle to edit.")
+            if doc["status"] == "processing" or current["revision"] != change.revision:
+                fail(409, "The bundle changed. Refresh its page assignments before editing.")
+            if change.undo:
+                target = current.get("undo_revision")
+                layout = current_layout(db, key, target) if target is not None else None
+                if layout is None:
+                    fail(409, "There is no earlier bundle layout to restore.")
+                if not layout["pending_pages"] and len(layout["offers"]) > available_slots(db, key, doc["batch"]):
+                    layout["reason"] = "Choose the active offers in this bundle. The batch can include at most five."
+            else:
+                offers = sorted(({**offer.model_dump(), "pages": sorted(offer.pages)} for offer in change.offers),
+                                key=lambda offer: offer["pages"][0])
+                pages = [page for offer in offers for page in offer["pages"]]
+                pages.extend(change.reference_pages)
+                pages.extend(item.page for item in change.excluded)
+                if len(set(pages)) != len(pages) or sorted(pages) != current["pages"]:
+                    fail(422, "Assign every original page exactly once.")
+                if any(not item.reason for item in change.excluded):
+                    fail(422, "Give a reason for every excluded page.")
+                if len(offers) > available_slots(db, key, doc["batch"]):
+                    fail(422, "The batch can include at most five active quotations.")
+                layout = {"pages": current["pages"], "offers": offers, "reference_pages": sorted(change.reference_pages),
+                          "excluded": sorted((item.model_dump() for item in change.excluded), key=lambda item: item["page"]),
+                          "pending_pages": [], "reason": "", "manual": True, "undo_revision": current["revision"]}
+                if all(layout[field] == current[field] for field in
+                       ("offers", "reference_pages", "excluded", "pending_pages", "reason")):
+                    return load_batch(db, doc["batch"])
+            stored = get_row(db, "snapshots", doc["snapshot_id"], "content")
+            try:
+                layout = save_layout(db, doc, json.loads(stored["content"]), layout, confirm_archive=change.confirm_archive)
+            except BundleError as exc:
+                fail(422, str(exc))
+            error = layout["reason"] or ("Assign every page of this bundle." if layout["pending_pages"] else "")
+            db.execute("UPDATE documents SET status = ?, error = ? WHERE id = ?",
+                       ("needs_review" if error else "ready", error, key))
+            rerun(db, doc["batch"])
+            return load_batch(db, doc["batch"])
+
     @app.post("/documents/{key}/retry", status_code=202)
     def retry(key: str, tasks: BackgroundTasks):
         with store.connection(write=True) as db:
-            doc = get_row(db, "documents", key, "batch, status, kind, snapshot_id")
-            if doc["status"] not in {"failed", "needs_review"}:
+            doc = get_row(db, "documents", key, "batch, status, kind, snapshot_id, role, bundle_parent, bundle_active")
+            if doc["bundle_parent"]:
+                if not doc["bundle_active"]:
+                    fail(409, "Restore this split before reading its pages again.")
+                key = doc["bundle_parent"]
+                doc = get_row(db, "documents", key, "batch, status, kind, snapshot_id, role")
+            if doc["status"] == "processing":
+                return {"id": key}
+            if doc["status"] not in {"failed", "needs_review"} and doc["role"] != "bundle":
                 snapshot = db.execute("SELECT content FROM snapshots WHERE id = ?", (doc["snapshot_id"],)).fetchone()
                 version = json.loads(snapshot["content"]).get("provenance", {}).get("parser") if snapshot else None
-                if doc["status"] != "ready" or doc["kind"] != "pdf" or version == PARSER_VERSION:
-                    fail(409, "Retry failed or flagged sources, or reprocess a PDF with an older parser.")
+                if doc["status"] != "ready" or version == PARSER_VERSION:
+                    fail(409, "Retry a failed or flagged source, or reprocess a source with an older parser.")
             if db.execute("SELECT 1 FROM overlays WHERE document = ?", (key,)).fetchone():
                 fail(409, "This source has manual corrections. Retain them and use the staging grid.")
             db.execute("UPDATE documents SET status = 'processing', error = '' WHERE id = ?", (key,))
@@ -528,12 +679,17 @@ def create_app(path):
     @app.delete("/documents/{key}")
     def delete_document(key: str):
         with store.connection(write=True) as db:
-            doc = get_row(db, "documents", key, "batch, role, name, digest")
-            if db.execute("SELECT 1 FROM documents WHERE revises = ?", (key,)).fetchone():
+            doc = get_row(db, "documents", key, "batch, role, name, digest, bundle_parent")
+            if doc["bundle_parent"]:
+                fail(409, "Use the quotation bundle editor to change active offers.")
+            if db.execute("""SELECT 1 FROM documents WHERE revises = ? OR revises IN
+                (SELECT id FROM documents WHERE bundle_parent = ?)""", (key, key)).fetchone():
                 fail(409, "This quotation has a revision. Remove the revision before deleting its original.")
             db.execute("DELETE FROM documents WHERE id = ?", (key,))
-            if doc["role"] == "bom":
-                clear_baseline_selection(db, doc["batch"])
+            if doc["role"] in BASELINE_ROLES:
+                selected = get_row(db, "batches", doc["batch"], "baseline_document")["baseline_document"]
+                if not selected or selected == key:
+                    clear_baseline_selection(db, doc["batch"])
             event(db, doc["batch"], "delete_document", {"document": key, "name": doc["name"], "sha256": doc["digest"]})
             rerun(db, doc["batch"])
             return load_batch(db, doc["batch"])
@@ -552,27 +708,15 @@ def create_app(path):
         with store.connection() as db:
             doc = get_row(db, "documents", key, "original, kind, snapshot_id")
             stored = db.execute("SELECT content FROM snapshots WHERE id = ?", (doc["snapshot_id"],)).fetchone()
+            layout = current_layout(db, key)
         if doc["kind"] != "pdf" or not stored:
             fail(404, "This supplier offer is unavailable.")
-        bundles = json.loads(stored["content"]).get("classification", {}).get("bundled_offers", [])
+        bundles = layout["offers"] if layout else json.loads(stored["content"]).get("classification", {}).get("bundled_offers", [])
         offer = next((item for item in bundles if item["pages"][0] == first_page), None)
         if not offer:
             fail(404, "This supplier offer is unavailable.")
         try:
-            with TemporaryDirectory(prefix="suriq-offer-") as tmp:
-                folder = Path(tmp)
-                path = folder / "original.pdf"
-                path.write_bytes(doc["original"])
-                pages = []
-                for page in offer["pages"]:
-                    run_command(["pdfseparate", "-f", str(page), "-l", str(page), str(path), str(folder / "page-%d.pdf")])
-                    pages.append(folder / f"page-{page}.pdf")
-                if len(pages) == 1:
-                    content = pages[0].read_bytes()
-                else:
-                    combined = folder / "offer.pdf"
-                    run_command(["pdfunite", *map(str, pages), str(combined)])
-                    content = combined.read_bytes()
+            content = extract_pages(doc["original"], offer["pages"])
         except (ExtractionError, OSError):
             fail(422, "The supplier pages could not be separated. Download the original to review them.")
         from urllib.parse import quote
@@ -657,12 +801,15 @@ def create_app(path):
 
     def pdf_preview(key, number, *, scale=None):
         with store.connection() as db:
-            doc = get_row(db, "documents", key, "kind, original, snapshot_id")
+            doc = get_row(db, "documents", key, "kind, original, snapshot_id, bundle_pages")
             stored = db.execute("SELECT content FROM snapshots WHERE id = ?", (doc["snapshot_id"],)).fetchone()
             if doc["kind"] != "pdf" or not stored or number not in {
                 source["ref"] for source in json.loads(stored["content"])["sources"]
             }:
                 fail(404, "The PDF page is unavailable.")
+            mapping = json.loads(doc["bundle_pages"])
+            if mapping:
+                number = mapping.index(number) + 1
         try:
             with TemporaryDirectory(prefix="suriq-render-") as tmp:
                 path = Path(tmp) / "original.pdf"
@@ -675,28 +822,31 @@ def create_app(path):
     @app.patch("/batches/{batch}/scope")
     def scope(batch: str, data: Scope):
         with store.connection(write=True) as db:
-            before = get_row(db, "batches", batch, "scope, scope_mode")
-            boms = [doc for doc in active_documents(documents(db, batch)) if doc["role"] == "bom"]
+            before = get_row(db, "batches", batch, "scope, scope_mode, baseline_document")
+            baseline = data.baseline or before["baseline_document"]
+            boms = [doc for doc in active_documents(documents(db, batch), baseline) if doc["role"] in BASELINE_ROLES]
+            if data.baseline and not any(doc["id"] == data.baseline for doc in boms):
+                fail(422, "Choose a BOM or BOQ from this batch.")
             if data.mode != "unknown" and len(boms) != 1:
-                fail(409, "Resolve the BOM role before selecting purchase scope.")
+                fail(409, "Choose one BOM or BOQ before selecting purchase scope.")
             rows = sorted(set(data.rows)) if data.mode == "selected" else []
             if rows and set(rows) - {line["id"] for line in boms[0]["lines"]}:
-                fail(422, "Purchase scope must reference material rows from this BOM.")
+                fail(422, "Purchase scope must reference material rows from the selected baseline.")
             if data.mode != "unknown" and not one_schedule(boms[0]["lines"], data.mode, rows):
                 fail(422, "Select material rows from one supplier schedule and project site.")
-            db.execute("UPDATE batches SET scope = ?, scope_mode = ? WHERE id = ?",
-                       (json.dumps(rows), data.mode, batch))
+            db.execute("UPDATE batches SET scope = ?, scope_mode = ?, baseline_document = ? WHERE id = ?",
+                       (json.dumps(rows), data.mode, baseline, batch))
             event(db, batch, "set_scope", {"before": [before["scope_mode"], json.loads(before["scope"])],
-                                            "after": [data.mode, rows]})
+                                            "after": [data.mode, rows], "baseline": baseline})
             rerun(db, batch)
             return load_batch(db, batch)
 
     @app.patch("/documents/{key}/coverage")
     def coverage(key: str, data: QuoteCoverage):
         with store.connection(write=True) as db:
-            doc = get_row(db, "documents", key, "role, batch, coverage")
-            if doc["role"] != "quote":
-                fail(422, "Coverage applies to supplier quotations.")
+            doc = get_row(db, "documents", key, "role, batch, coverage, bundle_active")
+            if doc["role"] != "quote" or not doc["bundle_active"]:
+                fail(422, "Coverage applies to active supplier quotations.")
             db.execute("UPDATE documents SET coverage = ? WHERE id = ?", (data.coverage, key))
             event(db, doc["batch"], "set_coverage", {"document": key, "before": doc["coverage"],
                                                      "after": data.coverage})
@@ -711,6 +861,8 @@ def create_app(path):
             batch = meta["batch"]
             docs = documents(db, batch)
             doc = next(doc for doc in docs if doc["id"] == key)
+            if doc.get("bundle") or not doc["bundle_active"]:
+                fail(409, "Edit the active quotation or change its page assignments.")
             term = target == "@terms"
             line = None if term else next((line for line in doc["lines"] if line["id"] == target), None)
             if not term and not line and not new:
@@ -724,9 +876,10 @@ def create_app(path):
                 fail(422, "Changing a material row's inclusion requires a reason.")
             if (data.match is not None or data.factor is not None) and (term or doc["role"] != "quote"):
                 fail(422, "Manual matches and conversions apply to quotation lines.")
+            scope = get_row(db, "batches", batch, "scope_mode, scope, baseline_document")
+            bom = next((doc for doc in active_documents(docs, scope["baseline_document"])
+                        if doc["role"] in BASELINE_ROLES), None)
             if data.match:
-                bom = next((doc for doc in active_documents(docs) if doc["role"] == "bom"), None)
-                scope = get_row(db, "batches", batch, "scope_mode, scope")
                 baseline = schedule_baseline(bom["lines"], scope["scope_mode"], json.loads(scope["scope"])) if bom else []
                 if data.match not in {line["id"] for line in baseline}:
                     fail(422, "Select an existing BOM line.")
@@ -743,13 +896,22 @@ def create_app(path):
                 changes["new"] = True
                 if not doc["lines"] and not any(source["warning"] for source in doc["sources"]):
                     db.execute("UPDATE documents SET status = 'ready', error = '' WHERE id = ?", (key,))
-            if "match" in data.model_fields_set:
+            changing_match = "match" in data.model_fields_set
+            match_changes = changes
+            if bom and (changing_match or data.factor is not None):
+                by_baseline = changes.setdefault("baseline_overrides", {})
+                old = {field: changes.pop(field) for field in ("match", "factor") if field in changes}
+                previous = changes.pop("match_baseline", None)
+                if old:
+                    by_baseline.setdefault(previous or bom["id"], old)
+                match_changes = by_baseline.setdefault(bom["id"], {})
+            if changing_match:
                 if data.match is None:
-                    changes.pop("match", None)
+                    match_changes.pop("match", None)
                 else:
-                    changes["match"] = data.match
+                    match_changes["match"] = data.match
             if data.factor is not None:
-                changes["factor"] = data.factor
+                match_changes["factor"] = data.factor
             if data.excluded is not None:
                 changes["excluded"] = data.excluded
             db.execute("""INSERT INTO overlays VALUES (?, ?, ?) ON CONFLICT(document, target)
@@ -780,10 +942,11 @@ def create_app(path):
             docs = documents(db, meta["batch"])
             doc = next(doc for doc in docs if doc["id"] == key)
             line = next((line for line in doc["lines"] if line["id"] == target), None)
-            bom = next((doc for doc in docs if doc["role"] == "bom"), None)
+            scope = get_row(db, "batches", meta["batch"], "scope_mode, scope, baseline_document")
+            bom = next((doc for doc in active_documents(docs, scope["baseline_document"])
+                        if doc["role"] in BASELINE_ROLES), None)
             if doc["role"] != "quote" or not line or not bom:
                 fail(422, "An extracted quotation line and a BOM are required.")
-            scope = get_row(db, "batches", meta["batch"], "scope_mode, scope")
             material = [row for row in bom["lines"] if row["anchors"] and not row.get("excluded") and row.get("kind") != "service"]
             anchored = schedule_baseline(material, scope["scope_mode"], json.loads(scope["scope"]))[:80]
         ids, message = suggest(line, anchored)

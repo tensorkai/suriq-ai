@@ -24,10 +24,10 @@ const MIN_ZOOM = 75;
 const MAX_PDF_ZOOM = 400;
 const MAX_TEXT_ZOOM = 200;
 
-export function SourceViewer({ doc, initial, anchors = [], onLink, draft, focus = 0, missing, searchHint, repair }: {
+export function SourceViewer({ doc, initial, anchors = [], onLink, draft, focus = 0, missing, searchHint, repair, evidenceLabel }: {
   doc: Document; initial?: number | string; anchors?: Anchor[];
   onLink?: (link: Link) => void; draft?: Link; focus?: number;
-  missing?: boolean; searchHint?: string; repair?: (source: number | string) => void;
+  missing?: boolean; searchHint?: string; repair?: (source: number | string) => void; evidenceLabel?: string;
 }) {
   const pdf = doc.kind === "pdf";
   const activeFocus = anchors.some(hasPreciseSource) ? focus : 0;
@@ -136,8 +136,12 @@ export function SourceViewer({ doc, initial, anchors = [], onLink, draft, focus 
 
   return <article className="source-card">
     <header className="source-header">
-      <span className={`role-tag ${doc.role}`}>{doc.role === "bom" ? "BOM" : doc.role === "quote" ? "QUOTE" : "REVIEW"}</span>
-      <div className="source-title"><strong>{docName(doc)}</strong><small title={doc.name}>{doc.name}</small></div>
+      <span className={`role-tag ${doc.role}`}>{({ bom: "BOM", boq: "BOQ", quote: "QUOTE", buyer: "BUYER",
+        bundle: "BUNDLE", reference: "REFERENCE", mixed: "REVIEW", unknown: "REVIEW", unsupported: "REVIEW" })[doc.role]}</span>
+      <div className="source-title"><strong>{docName(doc)}</strong>
+        {evidenceLabel && <span className="source-value-label">{evidenceLabel}</span>}
+        <small title={doc.name}>{doc.name}</small>
+      </div>
       <a className="icon-button" href={`${path}/original`} aria-label={`Download ${doc.name}`}><Download size={15} /></a>
     </header>
     {reference && <div className="source-reference">

@@ -1,13 +1,14 @@
 "use client";
 
 import { Check, ClipboardList, LocateFixed, ScanLine, ShieldCheck } from "lucide-react";
-import { useState } from "react";
+import { useId, useState } from "react";
 import { api, docName, documentFeedback, hasPreciseSource, lineFields, reviews, termFields } from "./model";
 import type { Anchor, Batch, Issue, ReviewStatus, SourceEditor } from "./model";
 import { Empty, PendingButton, Pill } from "./shared";
 import { SourceViewer } from "./viewer";
 
 const severity = { Blocking: 0, Warning: 1, Info: 2 };
+const noteLimit = 500;
 
 function needsReview(issue: Issue) {
   return issue.review.status === "open" || issue.review.status === "clarification";
@@ -78,7 +79,10 @@ export function Findings({ batch, update, initial, editSource }: {
             document.getElementById(`issue-${items[target].id}`)?.focus();
           }}>
           <span className={`severity-dot ${item.severity.toLowerCase()}`} />
-          <span><strong>{item.title}</strong><small>{item.severity} · {reviews[item.review.status]}</small></span>
+          <span><strong>{item.title}</strong>
+            {item.detail?.context && <small className="issue-context">{item.detail.context}</small>}
+            <small>{item.severity} · {reviews[item.review.status]}</small>
+          </span>
         </button>)}
       </div>
     </aside>
@@ -86,7 +90,14 @@ export function Findings({ batch, update, initial, editSource }: {
       <div className="issue-summary">
         <div className="inline"><Pill value={issue.severity} /><Pill value={reviews[issue.review.status]} />
           {issue.review_required && <Pill value="Check source" />}</div>
-        <h2>{issue.title}</h2><p>{documentFeedback(issue.note)}</p>
+        <h2>{issue.title}</h2>
+        {issue.detail?.context && <p className="issue-context">{issue.detail.context}</p>}
+        {issue.detail ? <dl className="finding-values">
+          <div><dt>Expected or required</dt><dd>{issue.detail.expected || "Unestablished"}</dd></div>
+          <div><dt>Offered or observed</dt><dd>{issue.detail.observed || "Unestablished"}</dd></div>
+          <div className="full"><dt>Difference or unresolved reason</dt><dd>{documentFeedback(issue.detail.reason)}</dd></div>
+          <div className="full"><dt>Action</dt><dd>{issue.detail.action}</dd></div>
+        </dl> : <p>{documentFeedback(issue.note)}</p>}
         {editors.length > 0 && <div className="inline">{editors.map((editor) => {
           const document = docs.get(editor.document);
           const source = issue.evidence.find((anchor) => anchor.document === editor.document && anchor.scope !== "document")?.source;
@@ -116,7 +127,7 @@ export function Findings({ batch, update, initial, editSource }: {
           const editor = editors.find((entry) => entry.document === doc?.id);
           const missing = issue.rule === "missing" && entry.source === undefined;
           return doc ? <SourceViewer key={`${issue.id}:${key}`} doc={doc} initial={entry.source} anchors={entry.anchors}
-            focus={focus} missing={missing}
+            focus={focus} missing={missing} evidenceLabel={issue.detail?.source_labels[doc.id]}
             searchHint={issue.search_hint || (editor
               ? (termFields[editor.field] ?? lineFields[editor.field])?.split(" / ")[0] : undefined)}
             repair={missing ? (source) => editSource({ document: doc.id, target: "new", field: "material", source }, issue.id)
@@ -142,6 +153,7 @@ function ReviewForm({ batch, issue, update, hasNext }: {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [advance, setAdvance] = useState(false);
+  const noteCount = useId();
   return <form className="review-form" onSubmit={async (event) => {
     event.preventDefault();
     const submitter = (event.nativeEvent as SubmitEvent).submitter;
@@ -157,8 +169,11 @@ function ReviewForm({ batch, issue, update, hasNext }: {
       {Object.entries(reviews).map(([key, label]) => <option key={key} value={key}
         disabled={key === "confirmed" && !issue.confirmable}>{label}</option>)}
     </select></label>
-    <label className="grow">Internal note<input placeholder="Optional review note" value={note} maxLength={500}
-      onChange={(event) => setNote(event.target.value)} /></label>
+    <label className="grow review-note">Internal note
+      <textarea aria-label="Internal note" aria-describedby={noteCount} placeholder="Optional review note"
+        rows={3} value={note} maxLength={noteLimit} onChange={(event) => setNote(event.target.value)} />
+      <small id={noteCount}>{note.length} / {noteLimit} characters</small>
+    </label>
     <PendingButton className="button secondary" type="submit" disabled={busy} pending={busy && !advance} pendingLabel="Saving review…"
       icon={<Check size={15} />}>Save review</PendingButton>
     {error && <p className="error" role="alert">{error}</p>}

@@ -22,6 +22,7 @@ def test_right_aligned_bom_and_summary_quote_can_be_verified(tmp_path, monkeypat
 
     def draw_bom(page):
         page.drawString(36, 780, "BILL OF MATERIALS & QUANTITIES")
+        page.drawString(36, 759, "Document reference: REQ-001")
         for x, name in zip((57, 207, 355, 391, 449, 517),
                            ("NO.", "ITEM SPECIFICATION", "QTY", "UNIT", "UNIT PRICE", "EXTENDED")):
             page.drawCentredString(x, 710, name)
@@ -33,6 +34,8 @@ def test_right_aligned_bom_and_summary_quote_can_be_verified(tmp_path, monkeypat
         page.drawRightString(548, 680, "85,400.00")
         page.drawString(45, 635, "SUM OF 1 ITEM EXTENSIONS")
         page.drawRightString(548, 635, "PHP 85,400.00")
+        page.drawString(45, 605, "MATERIALS TOTAL")
+        page.drawRightString(548, 605, "PHP 85,400.00")
 
     def draw_quote(page):
         page.drawString(36, 795, "RECONSTRUCTED / NOT ISSUED")
@@ -45,6 +48,7 @@ def test_right_aligned_bom_and_summary_quote_can_be_verified(tmp_path, monkeypat
         page.drawRightString(548, 660, "PHP 90,799.00")
         page.drawString(45, 620, "Price validity:")
         page.drawString(280, 620, "20 days, subject to supplier confirmation")
+        page.drawString(45, 594, "Quoted materials are detailed in document REQ-001.")
 
     monkeypatch.setenv("SURIQ_AI_PROVIDER", "off")
     monkeypatch.setenv("GEMINI_API_KEY", "synthetic-key")
@@ -74,7 +78,7 @@ def test_right_aligned_bom_and_summary_quote_can_be_verified(tmp_path, monkeypat
         result = ok(client.post(f"/batches/{batch}/verify"))
         assert not any(issue["rule"] == "missing" for issue in result["issues"])
         issue = next(issue for issue in result["issues"] if issue["rule"] == "materials_summary")
-        assert "399.00" in issue["note"] and issue["review_required"]
+        assert "399.00" in issue["note"] and issue["confirmable"]
         assert {anchor["document"] for anchor in issue["evidence"] if anchor["boxes"]} == {bom["id"], quote["id"]}
         comparison, = result["comparison"]
         assert comparison["total"] is None

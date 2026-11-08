@@ -2,11 +2,13 @@
 import os
 import re
 from pathlib import Path
+from subprocess import run
 from time import monotonic
 
 from playwright.sync_api import expect, sync_playwright
 
 from tests.fixtures import BOM, HEADERS, OFFER, TERMS, docx, pdf
+from tests.test_revision_bundles import bundle_pdf
 
 
 def release_request(page, requests):
@@ -87,6 +89,8 @@ def main():
         dimension.click()
         expect(page.get_by_role("tab", name="Quantity mismatch")).to_have_count(1)
         expect(page.get_by_role("tabpanel").locator(".source-card")).to_have_count(3)
+        expect(page.locator(".finding-values")).to_contain_text("16 mm")
+        expect(page.locator(".finding-values")).to_contain_text("12 mm")
         expect(page.get_by_role("status").filter(has_text=re.compile(r"Loading page \d+")).first).to_be_visible()
         release_request(page, previews)
         for file, number in (("quote.pdf", 2), ("A.pdf", 3), ("B.pdf", 1)):
@@ -170,12 +174,19 @@ def main():
         expect(page.get_by_text("Precise anchor unavailable")).to_have_count(0)
         dimension.click()
         page.get_by_label("Review status").select_option("false_positive")
-        page.get_by_label("Internal note").fill("Supplier clarified against the original.")
+        note = "Supplier clarified against the original.\nConfirm the replacement in stock."
+        page.get_by_label("Internal note").fill(note)
+        expect(page.get_by_label("Internal note")).to_have_attribute("maxlength", "500")
         page.get_by_role("button", name="Save and next").click()
         expect(dimension).to_have_count(0)
         page.get_by_role("button", name="Comparison", exact=True).click()
-        expect(page.get_by_role("heading", name="Offer comparison")).to_be_visible()
+        expect(page.get_by_role("heading", name="Supplier Quotation Summary")).to_be_visible()
         expect(page.get_by_text("Incomparable").first).to_be_visible()
+        expect(page.get_by_text("Internal canvass", exact=True)).to_be_visible()
+        freight = page.get_by_role("row", name=re.compile(r"^Freight"))
+        freight.get_by_role("button", name=re.compile(r"B\.pdf.*Page 1")).click()
+        expect(page.get_by_role("dialog", name="Source evidence")).to_be_visible()
+        page.get_by_role("button", name="Close dialog").click()
         page.get_by_role("button", name="Line items").click()
         page.get_by_role("checkbox", name="Exceptions only").check()
         expect(page.get_by_role("rowheader", name=re.compile("Copper pipe"))).to_be_visible()
@@ -212,11 +223,19 @@ def main():
             with page.expect_download() as download:
                 page.get_by_role("link", name=f"Download {heading}").click()
             assert download.value.suggested_filename.endswith("." + extension)
+            if extension == "pdf":
+                printed = run(["pdftotext", "-layout", str(download.value.path()), "-"],
+                              capture_output=True, check=True, text=True).stdout
+                assert "Supplier Quotation Summary" in printed and "Internal canvass" in printed
+                assert "Supplier clarified against the original." in printed
+                assert "Confirm the replacement in stock." in printed
         page.reload()
         expect(page.get_by_role("heading", name="Steel procurement")).to_be_visible()
         page.get_by_role("navigation", name="Batch workspace").get_by_role("button", name="Findings").click()
         page.get_by_label("Review filter").select_option("all")
         expect(dimension).to_contain_text("False positive")
+        dimension.click()
+        expect(page.get_by_label("Internal note")).to_have_value(note)
         page.set_viewport_size({"width": 390, "height": 844})
         dimension.click()
         mobile_zoom = page.get_by_role("group", name="Preview zoom").first
@@ -261,9 +280,43 @@ def main():
         expect(page.get_by_role("heading", name="Supplier name needed", exact=True)).to_be_visible()
         page.get_by_role("button", name="Add supplier name", exact=True).click()
         expect(page.get_by_role("dialog").get_by_label("Supplier name for quotations")).to_have_value("")
+        page.get_by_role("button", name="Close dialog", exact=True).click()
+
+        page.get_by_role("button", name="New batch", exact=True).click()
+        page.get_by_label("Batch name").fill("Bundle page assignment")
+        page.get_by_role("dialog").get_by_role("button", name="Create batch").click()
+        page.get_by_role("button", name="Upload", exact=True).click()
+        page.get_by_role("dialog").locator("input[type=file]").set_input_files({
+            "name": "offers-and-abstract.pdf", "mimeType": "application/pdf",
+            "buffer": bundle_pdf(("Steel A", "SQ-A"), "unclear", ("Steel B", "SQ-B"), "abstract"),
+        })
+        page.get_by_role("button", name="Upload and extract").click()
+        expect(page.get_by_role("heading", name="Supplier quotation bundle")).to_be_visible()
+        expect(page.get_by_text("Pages awaiting assignment", exact=True)).to_be_visible()
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.get_by_role("button", name="Edit page assignments").click()
+        bundle = page.get_by_role("dialog", name="Edit quotation bundle")
+        bundle.get_by_role("button", name="Save page assignments").click()
+        expect(bundle.get_by_role("alert")).to_have_text("Assign every original page exactly once.")
+        bundle.get_by_role("button", name="Exclude pages").click()
+        bundle.get_by_label("Excluded pages").fill("2")
+        bundle.get_by_label("Reason", exact=True).fill("Unrelated attachment")
+        bundle.get_by_role("button", name="Save page assignments").click()
+        expect(bundle).not_to_be_visible()
+        expect(page.get_by_role("button", name="Steel A · SQ-A · Pages 1", exact=True)).to_be_visible()
+        expect(page.get_by_role("button", name="Steel B · SQ-B · Pages 3", exact=True)).to_be_visible()
+        page.get_by_role("button", name="Page 4", exact=True).click()
+        expect(page.get_by_role("img", name=re.compile("Full source Page 4"))).to_be_visible()
+        page.get_by_role("button", name="Read bundle again", exact=True).click()
+        expect(page.get_by_role("button", name="Edit page assignments")).to_be_enabled()
+        page.get_by_role("button", name="Edit page assignments").click()
+        bundle.get_by_role("button", name="Undo last split change").click()
+        expect(page.get_by_text("Pages awaiting assignment", exact=True)).to_be_visible()
+        expect(page.get_by_text("Historical split", exact=True)).to_have_count(2)
+        assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
         assert not errors, errors
         browser.close()
-    print("Browser workflow passed: intake, grouped evidence, keyboard navigation, correction, review, comparison, exports.")
+    print("Browser workflow passed: intake, grouped evidence, keyboard navigation, correction, review, comparison, exports, bundle retry and undo.")
 
 
 if __name__ == "__main__":

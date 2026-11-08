@@ -4,11 +4,15 @@ import json
 import os
 import re
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal, localcontext
-from zoneinfo import ZoneInfo
 
 from service.extraction import ATTRIBUTES
+from service.commercial import (
+    COMMERCIAL_TERMS, COST_LABELS, MONEY_TERMS, as_manila, charge_treatment, compare_term,
+    currency_code, date_reading, document_currency, monetary_value, term_identity, timing_reading,
+    validity_interpretation, vat_treatment,
+)
 
 PRECISION = Decimal(1).scaleb(-int(os.getenv("SURIQ_MONEY_DECIMALS", "2")))
 UNIT_ALIASES = {
@@ -29,10 +33,13 @@ RULES = {
     "missing": "Item not quoted", "extra": "Additional item", "match": "Material match needs review",
     "duplicate": "Duplicate offer lines", "line_math": "Line arithmetic", "subtotal": "Subtotal arithmetic",
     "total": "Payable total arithmetic", "tax": "VAT basis unclear", "charges": "Charges unclear",
-    "validity": "Quotation validity", "delivery": "Delivery requirement",
+    "validity": "Quotation validity", "delivery": "Delivery requirement", "buyer_terms": "Buyer requirement",
     "extraction": "Source needs review", "terms": "Conflicting quote terms",
     "supplier_duplicate": "Multiple offers from supplier", "outside_scope": "Item outside purchase scope",
     "materials_summary": "Stated materials total difference",
+    "materials_reconciliation": "Materials reconciliation needs review",
+    "materials_price_variance": "Materials price variance",
+    "work_scope": "BOQ work item needs material breakdown",
 }
 
 
@@ -112,20 +119,8 @@ def source_evidence(doc):
 
 
 def date_value(value):
-    match = re.fullmatch(r"(?:valid until\s+)?(\d{4}-\d{2}-\d{2})(?: 00:00:00)?", value.strip(), re.I)
-    try:
-        return date.fromisoformat(match[1]) if match else None
-    except ValueError:
-        return None
-
-
-def duration(value):
-    match = re.fullmatch(r"(\d{1,3})\s*(calendar\s+|working\s+|business\s+)?(day|week)s?",
-                         value.strip(), re.I)
-    if not match:
-        return None
-    basis = (match[2] or "unspecified").strip().casefold()
-    return (int(match[1]) * (7 if match[3].casefold() == "week" else 1), basis)
+    reading = date_reading(value)
+    return reading.date() if isinstance(reading, datetime) else reading
 
 
 def pack_size(value):
@@ -160,28 +155,14 @@ def best_matches(line, baseline):
 
 
 def tax_basis(value):
-    key = norm(value)
-    if re.search(r"\b(?:not|or|tbc|tbd|unknown|pending|unclear|if|subject to)\b", key):
-        return "unknown"
-    bases = [
-        ("non-VAT", r"\bnon\s*vat\b|\bvat exempt\b"),
-        ("VAT inclusive", r"\b(inclusive|included)\b|\bwith vat\b"),
-        ("VAT exclusive", r"\b(exclusive|excluded)\b|\bplus vat\b"),
-    ]
-    detected = [basis for basis, pattern in bases if re.search(pattern, key)]
-    return detected[0] if len(detected) == 1 else "unknown"
-
-
-def charge(value):
-    if norm(value) in {"included", "inclusive", "free", "none", "no charge", "no additional charges", "n a"}:
-        return Decimal(0)
-    return decimal_value(value)
+    basis, _, _, _ = vat_treatment(value)
+    return "non-VAT" if basis == "Declared non-VAT" else basis
 
 
 def summary_quote(doc):
     if doc["role"] != "quote" or doc["lines"] or not doc.get("classification", {}).get("summary_only"):
         return False
-    return any((amount := decimal_value(doc["terms"].get(field, ""))) is not None and amount >= 0
+    return any((amount := monetary_value(doc["terms"].get(field, ""))) is not None and amount[1] >= 0
                and (anchor := evidence(doc, field=field)) and (
                    not anchor.get("weak") or anchor.get("method") == "model"
                    and doc.get("provenance", {}).get("provider") == "gemini"
@@ -191,7 +172,8 @@ def summary_quote(doc):
 
 def uncertain_source(doc):
     return (any(source["warning"] for source in doc["sources"])
-            or any(anchor.get("weak") for anchor in doc["term_anchors"].values())
+            or any(anchor.get("weak") for field, anchor in doc["term_anchors"].items()
+                   if field in MONEY_TERMS | {"tax", "tax_declaration", "currency"})
             or any(anchor.get("weak") for line in doc["lines"] for anchor in line["anchors"].values()))
 
 
@@ -212,6 +194,251 @@ def schedule_baseline(lines, scope_mode, scope):
     return [line for line in lines if line.get("schedule") in schedules]
 
 
+def term_anchors(doc, field):
+    values = [evidence(doc, field=field)]
+    values.extend({**entry["anchor"], "document": doc["id"]} for entry in doc.get("term_mentions", {}).get(field, [])
+                  if field not in doc.get("corrected_terms", []))
+    return [anchor for index, anchor in enumerate(values) if anchor and anchor not in values[:index]]
+
+
+def term_editor(doc, field):
+    return {"document": doc["id"], "target": "terms", "field": field}
+
+
+def terms_conflict(field, mentions, currency):
+    identities = {term_identity(field, entry["value"], currency, entry.get("scope", "")) for entry in mentions}
+    if field == "tax" and identities and all(identity[0] == "tax" for identity in identities):
+        bases = {(basis, scope) for _, basis, _, scope in identities}
+        rates = {rate for _, _, rate, _ in identities if rate is not None}
+        return len(bases) > 1 or len(rates) > 1
+    return len(identities) > 1
+
+
+def document_term_reference(doc, text):
+    return [{"document": doc["id"], "source": source["ref"], "text": text,
+             "weak": True, "scope": "document"} for source in doc["sources"][:1]]
+
+
+def commercial_requirements(quote, buyers, currency, add):
+    entries = []
+    terms = quote["terms"]
+    for field, label in COMMERCIAL_TERMS.items():
+        requirements = []
+        for buyer in buyers:
+            value = buyer["terms"].get(field)
+            if not value:
+                continue
+            readings = [value, *(entry["value"] for entry in buyer.get("term_mentions", {}).get(field, [])
+                                  if field not in buyer.get("corrected_terms", []))]
+            for reading in dict.fromkeys(readings):
+                requirements.append((buyer, reading))
+        offered = terms.get(field, "")
+        if not (requirements or offered):
+            continue
+        mentions = quote.get("term_mentions", {}).get(field, [])
+        offer_conflict = field not in quote.get("corrected_terms", []) and terms_conflict(field, mentions, currency)
+        offered_readings = "\n".join(dict.fromkeys(entry["value"] for entry in mentions)) if offer_conflict else offered
+        timing = {}
+        if field == "delivery":
+            timing = {"required_timing": [timing_reading(value) for value in dict.fromkeys(value for _, value in requirements)],
+                      "offered_timing": timing_reading(offered) if offered and not offer_conflict else None}
+        actual_anchors = term_anchors(quote, field)
+        if not requirements:
+            reason = "The quotation contains conflicting readings of this term." if offer_conflict else ""
+            finding = None
+            if not reason and field not in COST_LABELS and field != "validity" and (not actual_anchors or actual_anchors[0].get("weak")):
+                reason = (actual_anchors[0].get("quality_reason") if actual_anchors else None) or "Confirm this supplier term against the source."
+                finding = add("extraction", [quote["id"], f"term:{field}"], "commercial field", reason,
+                              "Warning", actual_anchors, review=True,
+                              detail={"observed": offered, "reason": reason, "action": f"Link the supplier’s {label.lower()} terms."},
+                              editors=[term_editor(quote, field)])
+            entries.append({"field": field, "label": label, "required": "", "offered": offered_readings,
+                            "status": "Needs clarification" if reason else "Supplier stated", "reason": reason,
+                            "evidence": actual_anchors, "finding": finding, **timing})
+            continue
+        required = "\n".join(dict.fromkeys(value for _, value in requirements))
+        anchors = [anchor for buyer, _ in requirements for anchor in term_anchors(buyer, field)]
+        expected_anchors = [anchor for index, anchor in enumerate(anchors) if anchor not in anchors[:index]]
+        intended = {term_identity(field, value, document_currency(buyer), buyer["terms"].get("project_site", ""))
+                    for buyer, value in requirements}
+        buyer, expected = requirements[0]
+        if len(intended) != 1:
+            status, reason = "Needs clarification", "Buyer sources state conflicting requirements. Confirm which requirement applies."
+        elif offer_conflict:
+            status, reason = "Needs clarification", "The quotation states conflicting values. Confirm which supplier term applies."
+        elif any(not evidence(source, field=field) or evidence(source, field=field).get("weak")
+                 for source, _ in requirements) or offered and (not actual_anchors or actual_anchors[0].get("weak")):
+            status, reason = "Needs clarification", "Confirm the reading and link the requirement or offer to its source."
+        elif (buyer_site := buyer["terms"].get("project_site")) and (offer_site := terms.get("project_site")) and norm(buyer_site) != norm(offer_site):
+            status, reason = "Needs clarification", "The buyer and supplier sources name different project sites."
+        else:
+            status, reason = compare_term(field, expected, offered, document_currency(buyer), currency)
+        if not actual_anchors:
+            actual_anchors = document_term_reference(quote, f"No {label.lower()} term was established in this quote.")
+        anchors = [*expected_anchors, *actual_anchors]
+        finding = None
+        if status != "Meets":
+            condition = [required, offered_readings or "unspecified"] if field == "delivery" else [field, required, offered_readings or "unspecified"]
+            action = ("Resolve the conflicting buyer requirements." if len(intended) != 1
+                      else f"Confirm the supplier’s {label.lower()} terms.")
+            finding = add("delivery" if field == "delivery" else "buyer_terms",
+                          "batch" if field == "delivery" else quote["id"], condition, reason,
+                          "Blocking" if field == "delivery" and status == "Differs" else "Warning", anchors,
+                          review=status == "Needs clarification",
+                          detail={"expected": required, "observed": offered_readings or "Unstated", "reason": reason, "action": action},
+                          editors=([term_editor(source, field) for source, _ in requirements] if len(intended) != 1 else [])
+                          + [term_editor(quote, field)])
+        entries.append({"field": field, "label": label, "required": required, "offered": offered_readings,
+                        "status": status, "reason": reason, "evidence": anchors, "finding": finding, **timing})
+    return entries
+
+
+MATERIALS_AMOUNTS = ("item_extensions_total", "materials_adjustment", "materials_total", "scoped_materials_total")
+
+
+def grounded_terms(doc, field):
+    if field in doc.get("corrected_terms", []) or not doc.get("term_mentions", {}).get(field):
+        readings = [{"value": doc["terms"].get(field, ""), "anchor": doc["term_anchors"].get(field)}]
+    else:
+        readings = doc["term_mentions"][field]
+    return [(entry["value"], {**anchor, "document": doc["id"]}) for entry in readings
+            if entry["value"] and (anchor := entry.get("anchor")) and not anchor.get("weak")
+            and (anchor.get("boxes") or anchor.get("cells"))]
+
+
+def materials_currency(doc):
+    currencies = {currency_code(value) for value, _ in grounded_terms(doc, "currency")}
+    currencies.update(amount[0] for field in MATERIALS_AMOUNTS
+                      for value, _ in grounded_terms(doc, field) if (amount := monetary_value(value)) and amount[0])
+    return next(iter(currencies)) if len(currencies) == 1 and all(re.fullmatch(r"[A-Z]{3}", value) for value in currencies) else None
+
+
+def printed_amount(value):
+    reading = monetary_value(re.sub(r"(?<!\d)\+(?=\d)", "", value))
+    return reading[1] if reading else None
+
+
+def one_grounded_value(doc, field, normalize=norm):
+    values = {normalize(value): (value, anchor) for value, anchor in grounded_terms(doc, field)}
+    return next(iter(values.values())) if len(values) == 1 and None not in values else ("", None)
+
+
+def selected_material_scope(baseline, scope, scope_name):
+    rows = [line for line in baseline["lines"] if line["id"] in scope]
+    listed, listed_anchor = one_grounded_value(baseline, "materials_scope_rows")
+    if listed_anchor:
+        codes = {compact(line["fields"].get("code", "")) for line in rows}
+        return listed_anchor if "" not in codes and codes == {compact(code) for code in re.split(r"[,;|]", listed)} else None
+    if len(rows) == len(baseline["lines"]) and not baseline.get("has_excluded_rows"):
+        return baseline["term_anchors"].get("materials_scope")
+    schedule = {line["id"] for line in baseline["lines"] if norm(line.get("schedule", "")) == norm(scope_name)}
+    return baseline["term_anchors"].get("materials_scope") if schedule and schedule == set(scope) else None
+
+
+def documented_material_scope(baseline, quote, mode, scope, partial):
+    buyer_site, _ = one_grounded_value(baseline, "project_site")
+    quote_site, _ = one_grounded_value(quote, "project_site")
+    if buyer_site and quote_site and norm(buyer_site) != norm(quote_site):
+        return [], "The baseline and quotation identify different project sites."
+    if any(len({norm(value) for value, _ in grounded_terms(doc, "project_site")}) > 1 for doc in (baseline, quote)):
+        return [], "The source lists conflicting project sites."
+    if any(len({norm(value) for value, _ in grounded_terms(doc, "materials_scope")}) > 1 for doc in (baseline, quote)):
+        return [], "The source lists conflicting materials scopes."
+
+    buyer_scope, buyer_scope_anchor = one_grounded_value(baseline, "materials_scope")
+    quote_scope, quote_scope_anchor = one_grounded_value(quote, "materials_scope")
+    same_named_scope = bool(buyer_scope and quote_scope and norm(buyer_scope) == norm(quote_scope))
+    if partial:
+        mapping = selected_material_scope(baseline, scope, buyer_scope) if mode == "selected" and same_named_scope else None
+        if not mapping:
+            return [], "The selected or partial purchase needs explicitly equivalent materials scope totals."
+        return [buyer_scope_anchor, quote_scope_anchor, {**mapping, "document": baseline["id"]}], ""
+    if buyer_scope and quote_scope and not same_named_scope:
+        return [], "The documents identify different materials scopes."
+    buyer_ref, buyer_ref_anchor = one_grounded_value(baseline, "reference", compact)
+    quote_ref, quote_ref_anchor = one_grounded_value(quote, "scope_reference", compact)
+    if quote["terms"].get("scope_reference") and (not buyer_ref or not quote_ref or compact(buyer_ref) != compact(quote_ref)):
+        return [], "The quotation references a different or unverified materials baseline."
+    if buyer_ref and quote_ref:
+        return [buyer_ref_anchor, quote_ref_anchor], ""
+    if same_named_scope and buyer_site and quote_site:
+        return [buyer_scope_anchor, quote_scope_anchor], ""
+    return [], "The quotation does not establish equivalent scope with this materials baseline."
+
+
+def reconcile_materials(baseline, quote, mode, scope):
+    result = {"status": "Unresolved", "arithmetic": "Unresolved", "reason": "",
+              "expected": None, "offered": None, "subtotal": None, "computed": None, "adjustments": [],
+              "difference": None, "currency": None, "evidence": [], "finding": None}
+
+    def unresolved(reason):
+        result["reason"] = reason
+        return result
+
+    partial = mode == "selected" or quote["coverage"] == "partial" or baseline.get("has_excluded_rows")
+    field = "scoped_materials_total" if partial else "materials_total"
+    expected_raw, expected_source = one_grounded_value(baseline, field, printed_amount)
+    offered_raw, offered_source = one_grounded_value(quote, field, printed_amount)
+    expected, offered = printed_amount(expected_raw), printed_amount(offered_raw)
+    for key, amount, source in (("expected", expected, expected_source), ("offered", offered, offered_source)):
+        if amount is not None and source:
+            result[key] = money(amount)
+            result["evidence"].append(source)
+
+    currency = materials_currency(baseline)
+    if not currency or materials_currency(quote) != currency:
+        return unresolved("A common, documented materials currency is unavailable.")
+    result["currency"] = currency
+    scope_evidence, reason = documented_material_scope(baseline, quote, mode, scope, partial)
+    if reason:
+        return unresolved(reason)
+    result["evidence"].extend(anchor for anchor in scope_evidence if anchor not in result["evidence"])
+    if expected is None or offered is None or expected < 0 or offered < 0:
+        return unresolved("Both sources need an unambiguous, labeled materials total.")
+
+    if not partial:
+        subtotal_raw, subtotal_source = one_grounded_value(baseline, "item_extensions_total", printed_amount)
+        subtotal = printed_amount(subtotal_raw)
+        if subtotal_source is None and baseline["terms"].get("item_extensions_total"):
+            return unresolved("The printed item-extension subtotal needs a reliable reading.")
+        if subtotal is not None:
+            result["subtotal"] = money(subtotal)
+            result["evidence"].append(subtotal_source)
+            adjustments = {}
+            for raw, source in grounded_terms(baseline, "materials_adjustment"):
+                adjustment = printed_amount(raw)
+                label = source.get("label", "Materials reconciliation allowance")
+                category = "deduction" if "deduction" in norm(label) else "surcharge" if "surcharge" in norm(label) else "allowance"
+                if adjustment is not None:
+                    adjustment = -abs(adjustment) if category == "deduction" else adjustment
+                    if category in adjustments and adjustments[category][1] != adjustment:
+                        return unresolved("The baseline shows conflicting materials adjustments.")
+                    adjustments[category] = (label, adjustment, source)
+            for label, adjustment, source in adjustments.values():
+                result["adjustments"].append({"label": label, "value": money(adjustment)})
+                result["evidence"].append(source)
+            calculated = subtotal + sum((entry[1] for entry in adjustments.values()), Decimal(0))
+            result["computed"] = money(calculated)
+            if money(calculated) != money(expected):
+                result["finding"] = "materials_reconciliation"
+                return unresolved("The item-extension subtotal and documented materials adjustments do not reconcile to the stated materials total.")
+            result["arithmetic"] = "Verified"
+
+    if result["arithmetic"] != "Verified":
+        result["arithmetic"] = "Unverified"
+    difference = Decimal(money(offered)) - Decimal(money(expected))
+    result["difference"] = money(difference)
+    if money(expected) == money(offered):
+        result.update(status="Matches", reason="The stated materials totals match on the documented scope.")
+    elif "estimat" in norm(expected_source.get("label", "")):
+        result.update(status="Price variance", finding="materials_price_variance",
+                      reason=f"The offer differs from the materials estimate by {currency} {money(abs(difference))}.")
+    else:
+        result.update(status="Differs", finding="materials_summary",
+                      reason=f"Stated materials totals differ by {currency} {money(abs(difference))} on the documented scope.")
+    return result
+
+
 def verify(documents, scope_mode, scope, as_of=None):
     with localcontext() as context:
         context.prec = 60
@@ -219,9 +446,10 @@ def verify(documents, scope_mode, scope, as_of=None):
 
 
 def verify_in_context(documents, scope_mode, scope, as_of):
-    as_of = as_of or datetime.now(ZoneInfo("Asia/Manila")).date()
-    bom = next(doc for doc in documents if doc["role"] == "bom")
+    as_of = as_manila(as_of)
+    bom = next(doc for doc in documents if doc["role"] in {"bom", "boq"})
     quotes = [doc for doc in documents if doc["role"] == "quote"]
+    buyers = [bom, *(doc for doc in documents if doc["role"] == "buyer")]
     baseline = {line["id"]: line for line in schedule_baseline(bom["lines"], scope_mode, scope)}
     required = {key: line for key, line in baseline.items()
                 if scope_mode == "all" or (scope_mode == "selected" and key in scope)}
@@ -233,7 +461,7 @@ def verify_in_context(documents, scope_mode, scope, as_of):
         supplier_docs[norm(quote["supplier"])].append(quote)
     rank = {"Blocking": 0, "Warning": 1, "Info": 2}
 
-    def add(rule, subject, condition, note, severity, anchors, *, review=False):
+    def add(rule, subject, condition, note, severity, anchors, *, review=False, detail=None, editors=()):
         key = hashlib.sha256(json.dumps([rule, subject, condition], sort_keys=True).encode()).hexdigest()[:20]
         review |= any(a is None for a in anchors)
         anchors = [a for a in anchors if a]
@@ -247,11 +475,27 @@ def verify_in_context(documents, scope_mode, scope, as_of):
             issue["severity"] = severity
         issue["review_required"] |= review or not exact or any(a.get("weak") for a in anchors)
         issue["confirmable"] &= bool(exact) and not review and not any(a.get("weak") for a in anchors)
+        if detail:
+            issue["detail"] = detail
+        for editor in editors:
+            links = issue.setdefault("source_editors", [])
+            if editor not in links:
+                links.append(editor)
         for anchor in anchors:
             if anchor not in issue["evidence"]:
                 issue["evidence"].append(anchor)
+        return key
 
     for doc in documents:
+        if doc["role"] not in {"bom", "boq", "quote", "buyer"}:
+            continue
+        for line in doc.get("work_lines", []):
+            action = "Link separate material quantity and unit evidence or keep this work item outside the material comparison."
+            add("work_scope", [doc["id"], line["id"]], "bundled work",
+                "This work item has no separately documented material quantity and unit.", "Warning",
+                [evidence(doc, line)], review=True,
+                detail={"observed": line["fields"].get("material", line["fields"].get("description", "")), "action": action},
+                editors=[{"document": doc["id"], "target": line["id"], "field": "material_quantity"}])
         for source in doc["sources"]:
             if source["warning"]:
                 add("extraction", doc["id"], source["ref"], source["warning"], "Warning",
@@ -263,7 +507,7 @@ def verify_in_context(documents, scope_mode, scope, as_of):
                 add("extraction", [doc["id"], line["id"]], "quantity or unit",
                     "Material row has a missing or unreadable quantity or unit.", "Warning",
                     [evidence(doc, line)], review=True)
-        if not doc["lines"] and not summary_quote(doc):
+        if doc["role"] != "buyer" and not doc["lines"] and not summary_quote(doc):
             add("extraction", doc["id"], "no rows", "No material rows were recognized.", "Warning",
                 source_evidence(doc), review=True)
 
@@ -405,22 +649,22 @@ def verify_in_context(documents, scope_mode, scope, as_of):
             else:
                 difference("unit", bf.get("unit", ""), qf.get("unit", ""), review=True)
 
-            for field, parser in (("delivery_date", date_value), ("lead_time", duration)):
+            for field in ("delivery_date", "lead_time"):
                 if not bf.get(field):
                     continue
-                expected = parser(bf[field])
                 term = quote["terms"].get("delivery", "")
-                actual = parser(qf.get(field, "") or term)
-                compatible = expected is not None and actual is not None and (
-                    field != "lead_time" or expected[1] == actual[1]
-                )
-                if not compatible or actual > expected:
+                observed = qf.get(field, "") or term
+                status, reason = compare_term("delivery", bf[field], observed)
+                compatible = status == "Differs"
+                if status != "Meets":
                     state = "mismatch" if compatible or state == "mismatch" else "needs review"
-                    add("delivery", key, [bf[field], qf.get(field, "") or term],
-                        f"{item} requires {bf[field][:50]}. Offer: {(qf.get(field) or term or 'unspecified')[:50]}.",
+                    add("delivery", key, [bf[field], observed],
+                        f"{item} requires {bf[field][:50]}. Offer: {(observed or 'unspecified')[:50]}.",
                         "Blocking" if compatible else "Warning",
                         [evidence(bom, line, field), evidence(quote, offer, field) or
-                         evidence(quote, field="delivery") or evidence(quote, offer)], review=not compatible)
+                         evidence(quote, field="delivery") or evidence(quote, offer)], review=not compatible,
+                        detail={"expected": bf[field], "observed": observed or "Unstated", "reason": reason,
+                                "action": "Confirm the delivery commitment."})
             if state == "pass" and any(
                 value and field not in {"preferred_brand", "unit_price", "amount"} and
                 (field not in row["anchors"] or row["anchors"][field].get("weak"))
@@ -431,7 +675,10 @@ def verify_in_context(documents, scope_mode, scope, as_of):
 
         terms = quote["terms"]
         reasons = []
-        cost_fields = ("subtotal", "total", "tax", "vat", "freight", "charges", "discount", "currency")
+        declared_currency = document_currency(quote)
+        currency = declared_currency or "PHP"
+        cost_fields = ("subtotal", "total", "tax", "tax_declaration", "vat", "freight", "handling",
+                       "charges", "discount", "currency", "labor_equipment", "mobilization")
         if any(terms.get(field) and (
             not (anchor := evidence(quote, field=field)) or anchor.get("weak")
         ) for field in cost_fields):
@@ -452,27 +699,44 @@ def verify_in_context(documents, scope_mode, scope, as_of):
             reasons.append("Extraction or line matching requires review")
         if scope_mode == "selected" and any(key not in required for key in offered):
             reasons.append("Quote includes items outside purchase scope")
+        conflicting = set()
         for field, mentions in quote["term_mentions"].items():
             if field in quote.get("corrected_terms", []):
                 continue
-            if len({norm(mention["value"]) for mention in mentions}) > 1:
-                reasons.append(f"Conflicting {field} terms")
-                add("terms", [quote["id"], field], field, f"The offer contains conflicting {field} entries.",
-                    "Warning", [{**m["anchor"], "document": quote["id"]} for m in mentions], review=True)
+            if terms_conflict(field, mentions, declared_currency):
+                conflicting.add(field)
+                if field in cost_fields:
+                    reasons.append(f"Conflicting {field} terms")
+                readings = "\n".join(dict.fromkeys(mention["value"] for mention in mentions))
+                reason = f"The offer contains conflicting {field.replace('_', ' ')} entries."
+                add("terms", [quote["id"], field], field, reason, "Warning", term_anchors(quote, field), review=True,
+                    detail={"observed": readings, "reason": reason, "action": "Confirm which source entry applies."},
+                    editors=[term_editor(quote, field)])
+        if any(reading[0] and reading[0] != currency for field in MONEY_TERMS
+               if (reading := monetary_value(terms.get(field, "")))):
+            reasons.append("Stated amounts use different currencies")
 
         subtotal = decimal_value(terms.get("subtotal", ""))
-        if summary and scope_mode == "all" and quote["coverage"] != "partial":
-            expected_raw = bom["terms"].get("item_extensions_total", "")
-            stated_raw = terms.get("materials_total", "")
-            expected, stated = decimal_value(expected_raw), decimal_value(stated_raw)
-            anchors = [evidence(bom, field="item_extensions_total"), evidence(quote, field="materials_total")]
-            php = all(re.match(r"^(?:PHP\.?|₱)", value, re.I) for value in (expected_raw, stated_raw))
-            if (php and expected is not None and stated is not None and money(expected) != money(stated)
-                    and all(anchor and not anchor.get("weak") for anchor in anchors)
-                    and not bom.get("has_excluded_rows")):
-                add("materials_summary", quote["id"], [money(expected), money(stated)],
-                    f"Stated materials totals differ by PHP {money(abs(stated - expected))}. Confirm coverage and the source figures.",
-                    "Warning", anchors, review=True)
+        materials = reconcile_materials(bom, quote, scope_mode, scope) if summary else None
+        if materials and (rule := materials["finding"]):
+            expected, offered = materials["expected"], materials["offered"]
+            currency_label = materials["currency"]
+            reconciliation = rule == "materials_reconciliation"
+            field = "scoped_materials_total" if scope_mode == "selected" else "materials_total"
+            action = ("Link the documented materials adjustment or correct the stated baseline amounts."
+                      if reconciliation else "Check both stated materials totals against their source.")
+            editors = [term_editor(bom, "materials_adjustment")] if reconciliation else [
+                term_editor(bom, field), term_editor(quote, field),
+            ]
+            materials["finding"] = add(
+                rule, quote["id"], [expected, offered, materials["subtotal"], materials["adjustments"]],
+                materials["reason"], "Info" if rule == "materials_price_variance" else "Warning",
+                materials["evidence"], review=rule == "materials_reconciliation",
+                detail={"expected": f"{currency_label} {expected}",
+                        "observed": f"{currency_label} {materials['computed'] if reconciliation else offered}",
+                        "reason": materials["reason"], "action": action},
+                editors=editors,
+            )
         computed = sum(line_amounts, Decimal(0))
         if bad_lines:
             reasons.append("One or more line amounts cannot be verified")
@@ -484,40 +748,94 @@ def verify_in_context(documents, scope_mode, scope, as_of):
                     "Warning", [evidence(quote, field="subtotal"), *[
                         evidence(quote, line, "amount") for line in quote["lines"]
                     ]])
-        basis = tax_basis(terms.get("tax", ""))
-        vat = decimal_value(terms.get("vat", ""))
-        rate_text = re.search(r"(\d+(?:\.\d{1,3})?)\s*%", terms.get("tax", ""))
+        basis, price_treatment, declaration, ambiguous_tax = vat_treatment(
+            terms.get("tax", ""), terms.get("tax_declaration", ""))
+        vat_reading = monetary_value(terms.get("vat", ""))
+        vat = vat_reading[1] if vat_reading else None
+        rate_candidates = [terms.get("tax", ""), terms.get("tax_declaration", ""),
+                           *(entry["value"] for entry in quote["term_mentions"].get("tax", [])
+                             if "tax" not in quote.get("corrected_terms", []) and not entry["anchor"].get("weak"))]
+        rate_text = next((match for value in rate_candidates
+                          if (match := re.search(r"(\d+(?:\.\d{1,3})?)\s*%", value))), None)
         rate = Decimal(rate_text[1]) / 100 if rate_text else None
-        if basis == "unknown" or (basis == "VAT exclusive" and vat is None and rate is None):
-            reasons.append("VAT basis or exclusive VAT amount is unknown")
-            add("tax", quote["id"], basis, "The VAT basis or amount payable is not established.",
-                "Warning", [evidence(quote, field="tax"), evidence(quote, field="vat"), *source_evidence(quote)],
-                review=True)
-        if basis == "non-VAT" and vat not in (None, Decimal(0)):
-            reasons.append("Non-VAT declaration conflicts with a VAT amount")
-            add("tax", quote["id"], "non-VAT amount", "A non-VAT declaration accompanies a VAT amount.",
-                "Warning", [evidence(quote, field="tax"), evidence(quote, field="vat")])
-        freight = charge(terms.get("freight", ""))
-        extra = charge(terms["charges"]) if "charges" in terms else None
-        discount = charge(terms["discount"]) if "discount" in terms else None
-        for field, value in (("freight", freight), ("charges", extra), ("discount", discount)):
+        tax_anchors = [anchor for field in ("tax", "tax_declaration", "vat") for anchor in term_anchors(quote, field)]
+        tax_reason, tax_status, vat_finding = "", basis, None
+        if ambiguous_tax or conflicting & {"tax", "tax_declaration", "vat"}:
+            basis, tax_status = "unknown", "Ambiguous or conflicting"
+            tax_reason = "VAT basis unclear. The quotation uses ambiguous or conflicting VAT wording."
+        elif basis == "unknown":
+            tax_status = "Basis unstated"
+            if vat is None:
+                tax_reason = "VAT basis unstated. Confirm how VAT applies to the quoted prices."
+            else:
+                symbol = "₱" if currency == "PHP" else f"{currency} "
+                tax_reason = f"VAT basis unclear. The quote lists {symbol}{vat:,.2f} VAT but does not state how VAT applies to the prices."
+        elif basis in {"Declared non-VAT", "VAT exempt", "Zero-rated"} and vat not in (None, Decimal(0)):
+            tax_status = "Conflicting amount"
+            tax_reason = f"The quote states {basis} but also lists a nonzero VAT amount."
+        elif basis == "Mixed VAT treatment":
+            tax_reason = "Mixed VAT treatment. Confirm which amounts are taxable, exempt or zero-rated."
+        elif basis == "VAT exclusive" and ((vat is None and rate is None) or vat is not None and vat < 0):
+            tax_status = "VAT inputs incomplete"
+            tax_reason = "VAT exclusive. The quote does not establish the VAT amount or inputs needed to compute the payable total."
+        elif basis == "VAT exclusive" and vat is None and any(
+            charge_treatment(terms[field])[1] != 0 for field in COST_LABELS if terms.get(field)
+        ):
+            tax_status = "VAT inputs incomplete"
+            tax_reason = "VAT exclusive. The quote does not establish how VAT applies to the separately stated charges or discounts."
+        if not tax_anchors:
+            tax_anchors = document_term_reference(quote, "The quote does not establish how VAT applies.")
+        if tax_reason:
+            reasons.append(tax_reason)
+            field = "vat" if basis == "VAT exclusive" else "tax"
+            vat_finding = add("tax", quote["id"], basis, tax_reason, "Warning", tax_anchors,
+                              review=True, editors=[term_editor(quote, field)],
+                              detail={"observed": terms.get("tax") or terms.get("tax_declaration") or terms.get("vat", "Unstated"),
+                                      "reason": tax_reason, "action": "Confirm the supplier’s VAT declaration."})
+        costs = [{"field": "vat", "label": "VAT", "value": terms.get("tax", "") or terms.get("tax_declaration", ""),
+                  "price_treatment": price_treatment, "declaration": terms.get("tax_declaration", "") or declaration,
+                  "quoted_amount": terms.get("vat", ""), "status": tax_status, "reason": tax_reason,
+                  "evidence": tax_anchors, "finding": vat_finding}]
+        charges = {}
+        for field, label in COST_LABELS.items():
+            raw = terms.get(field, "")
+            status, value = charge_treatment(raw)
+            if field in conflicting:
+                status, value = "Conflicting", None
+            if (read := monetary_value(raw)) and read[0] and read[0] != currency:
+                status, value = "Different currency", None
             if value is not None and value < 0:
-                reasons.append(f"{field.capitalize()} has an unclear sign convention")
-            # Missing freight is consequential. An absent extra charge/discount is only covered
-            # when a declared payable total reconciles against the explicitly stated amounts.
-            if value is None and (field == "freight" or field in terms):
+                status, value = "Sign unclear", None
+            charges[field] = value
+            if not (field == "freight" or raw):
+                continue
+            anchors = term_anchors(quote, field)
+            reason = ""
+            finding = None
+            if value is None:
+                action = ("Confirm whether delivery is included or separately charged." if field == "freight"
+                          else f"Confirm how {label.lower()} affects the payable total.")
+                reason = f"{label} {status.lower()}. {action}"
                 reasons.append(f"{field.capitalize()} is unclear")
-                add("charges", [quote["id"], field], field, f"{field.capitalize()} is not established.",
-                    "Warning", [evidence(quote, field=field), *source_evidence(quote)], review=True)
+                anchors = anchors or document_term_reference(quote, f"No {label.lower()} term was established in this quote.")
+                finding = add("charges", [quote["id"], field], field, reason, "Warning", anchors, review=True,
+                              detail={"observed": raw or "Unstated", "reason": reason, "action": action},
+                              editors=[term_editor(quote, field)])
+            costs.append({"field": field, "label": label, "value": raw, "status": status, "reason": reason,
+                          "evidence": anchors, "finding": finding})
+        freight, extra, handling, discount = (charges[field] for field in ("freight", "charges", "handling", "discount"))
+        if not summary and any(charges[field] for field in ("labor_equipment", "mobilization")):
+            reasons.append("Labor or mobilization is priced separately from the material comparison")
 
         declared_total = decimal_value(terms.get("total", ""))
         payable = None
-        if not summary and not bad_lines and freight is not None and basis != "unknown":
-            base = computed + freight + (extra or 0) - (discount or 0)
+        if (not summary and not bad_lines and freight is not None and not tax_reason
+                and all(charges[field] is not None for field in ("handling", "charges", "discount") if field in terms)):
+            base = computed + freight + (extra or 0) + (handling or 0) - (discount or 0)
             if basis == "VAT exclusive":
                 if vat is not None and vat >= 0:
                     payable = base + vat
-                elif rate is not None and freight == 0 and not extra and not discount:
+                elif rate is not None and freight == 0 and not extra and not handling and not discount:
                     payable = base + Decimal(money(computed * rate))
                 else:
                     reasons.append("VAT basis for adjustments is unspecified")
@@ -527,7 +845,7 @@ def verify_in_context(documents, scope_mode, scope, as_of):
                 reasons.append("Quoted total differs from documented arithmetic")
                 add("total", quote["id"], [money(payable), money(declared_total)],
                     f"Documented amounts sum to {money(payable)}. The quote states {money(declared_total)}.",
-                    "Warning", [evidence(quote, field=field) for field in ("subtotal", "freight", "vat",
+                    "Warning", [evidence(quote, field=field) for field in ("subtotal", "freight", "vat", "handling",
                                                                         "charges", "discount", "total") if terms.get(field)] + [
                         evidence(quote, line, "amount") for line in quote["lines"]
                     ])
@@ -535,47 +853,55 @@ def verify_in_context(documents, scope_mode, scope, as_of):
                 reasons.append("Payable total or explicit adjustments are missing")
             if payable is not None and payable < 0:
                 reasons.append("Documented adjustments imply a negative payable total")
-        quote_date = date_value(terms.get("quote_date", ""))
-        expiry = date_value(terms.get("validity", ""))
-        days = duration(terms.get("validity", ""))
-        if not expiry and quote_date and days and days[1] == "calendar":
-            try:
-                expiry = quote_date + timedelta(days=days[0])
-            except OverflowError:
-                expiry = None
-        if expiry and expiry < as_of:
-            reasons.append("Offer validity has expired")
-            add("validity", quote["id"], expiry.isoformat(), f"The offer expired on {expiry.isoformat()}.",
-                "Warning", [evidence(quote, field="validity")] + ([evidence(quote, field="quote_date")] if days else []))
-        elif terms.get("validity") and not expiry:
-            add("validity", quote["id"], "unclear", "The offer expiry date needs clarification.", "Info",
-                [evidence(quote, field="validity")], review=True)
+        timing = validity_interpretation(terms, as_of)
+        timing_anchors = term_anchors(quote, "validity")
+        if timing["duration"]:
+            timing_anchors.extend(term_anchors(quote, "quote_date"))
+        timing["evidence"] = timing_anchors
+        timing["finding"] = None
+        timing_fields = {"validity", "quote_date"} if timing["duration"] else {"validity"}
+        if terms.get("validity") and (conflicting & timing_fields or any(
+            terms.get(field) and (not (anchor := evidence(quote, field=field)) or anchor.get("weak"))
+            for field in timing_fields
+        )):
+            timing.update(status="Needs clarification", expiry=None,
+                          reason="The validity wording or quotation date needs a reliable, unambiguous source reading.")
+        if timing["status"] in {"Expired", "Needs clarification"}:
+            expired = timing["status"] == "Expired"
+            if expired:
+                reasons.append("Offer validity has expired")
+            timing["finding"] = add("validity", quote["id"], timing["expiry"] or "unclear", timing["reason"],
+                                    "Warning" if expired else "Info", timing_anchors, review=not expired,
+                                    detail={"observed": timing["verbatim"], "reason": timing["reason"],
+                                            "action": "Obtain a current quotation." if expired else "Confirm the offer expiry."},
+                                    editors=[term_editor(quote, "validity")] + ([term_editor(quote, "quote_date")]
+                                                                              if timing["duration"] else []))
 
-        needed = date_value(bom["terms"].get("delivery", ""))
-        if needed:
-            delivery = date_value(terms.get("delivery", ""))
-            if not delivery or delivery > needed:
-                reasons.append("Delivery requirement is unresolved")
-                add("delivery", "batch", [needed.isoformat(), delivery.isoformat() if delivery else "unspecified"],
-                    f"Delivery is required by {needed}. The offer lists {delivery or 'no comparable date'}.",
-                    "Blocking" if delivery else "Warning",
-                    [evidence(bom, field="delivery"), evidence(quote, field="delivery") or
-                     next(iter(source_evidence(quote)), None)], review=not delivery)
-        currency = terms.get("currency", "PHP").strip().upper()
-        currency = {"₱": "PHP", "PESO": "PHP", "PESOS": "PHP"}.get(currency, currency)
+        commercial_terms = commercial_requirements(quote, buyers, currency, add)
+        if date_value(bom["terms"].get("delivery", "")) and any(
+            entry["field"] == "delivery" and entry["status"] != "Meets" for entry in commercial_terms
+        ):
+            reasons.append("Delivery requirement is unresolved")
         if currency != "PHP":
             reasons.append("Currency differs from the PHP comparison basis")
+        if quote.get("work_lines"):
+            reasons.append("Some quoted work lacks a separate material breakdown")
         comparisons.append({
             "document": quote["id"], "supplier": quote["supplier"], "coverage": quote["coverage"],
             "items": matrix, "terms": terms, "tax_basis": basis, "currency": currency,
             "subtotal": money(subtotal) if subtotal is not None else None,
             "line_sum": money(computed) if line_amounts else None,
             "total": money(payable) if payable is not None and not reasons else None,
-            "reasons": reasons, "expiry": expiry.isoformat() if expiry else None,
+            "reasons": list(dict.fromkeys(reasons)), "expiry": timing["expiry"],
+            "materials": materials,
+            "commercial": {"terms": commercial_terms, "costs": costs, "validity": timing},
         })
 
     for issue in issues.values():
-        issue["fingerprint"] = hashlib.sha256(json.dumps(issue, sort_keys=True).encode()).hexdigest()
+        fingerprint_data = {field: value for field, value in issue.items() if field not in {"detail", "source_editors"}}
+        fingerprint_data["evidence"] = [{field: value for field, value in anchor.items() if field != "quality_reason"}
+                                        for anchor in issue["evidence"]]
+        issue["fingerprint"] = hashlib.sha256(json.dumps(fingerprint_data, sort_keys=True).encode()).hexdigest()
     return {
         "issues": sorted(issues.values(), key=lambda issue: rank[issue["severity"]]),
         "comparison": sorted(comparisons, key=lambda row: (

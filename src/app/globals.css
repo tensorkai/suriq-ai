@@ -142,7 +142,16 @@ svg { flex-shrink: 0; }
 .issue-summary { padding: 14px; background: #f7faf5; border: 1px solid var(--line); border-radius: 8px; }
 .issue-summary h2 { margin: 8px 0 3px; }
 .issue-summary p { color: #42574b; }
+.issue-context { overflow-wrap: anywhere; }
+.issue-tabs .issue-context { margin: 3px 0; }
+.finding-values { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(165px, 100%), 1fr)); gap: 7px; margin: 11px 0; }
+.finding-values > div { min-width: 0; padding: 7px 9px; border-left: 2px solid #b9cec0; background: var(--paper); }
+.finding-values > .full { grid-column: 1 / -1; }
+.finding-values dt { color: var(--muted); font-size: 11px; font-weight: 680; }
+.finding-values dd { margin: 2px 0 0; white-space: pre-line; overflow-wrap: anywhere; }
 .review-form { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; margin-top: 13px; }
+.review-note textarea { resize: vertical; }
+.review-note small { color: var(--muted); font-weight: 450; }
 .evidence-heading p { color: var(--muted); font-size: 12px; }
 .evidence-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(245px, 100%), 1fr)); gap: 10px; margin-bottom: 10px; }
 .source-card { min-width: 0; border: 1px solid #d8e4d9; border-radius: 8px; overflow: hidden; background: #fff; align-self: start; }
@@ -152,6 +161,7 @@ svg { flex-shrink: 0; }
 .role-tag.quote { background: #edf0f6; color: #415975; }
 .source-title { flex: 1; min-width: 0; }
 .source-title strong { display: block; font-size: 12px; }
+.source-value-label { display: block; color: var(--green); font-size: 11px; overflow-wrap: anywhere; }
 .source-title small { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
 .source-navigation { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: #f9fbf7; padding: 4px; }
 .source-navigation select { width: auto; max-width: 52%; font-size: 12px; min-height: 27px; padding: 3px; }
@@ -273,7 +283,11 @@ svg { flex-shrink: 0; }
 .activity-values dd { margin: 0; overflow-wrap: anywhere; }
 
 .comparison-controls { justify-content: space-between; margin-bottom: 12px; }
-.comparison-reasons { margin-top: 6px; }
+.summary-scroll { border: 1px solid var(--line); border-radius: 8px; }
+.summary-matrix th:first-child { min-width: 132px; width: 17%; }
+.summary-matrix td { min-width: 185px; }
+.summary-value { white-space: pre-line; overflow-wrap: anywhere; }
+.summary-source { display: block; margin-top: 5px; font-size: 11px; text-align: left; overflow-wrap: anywhere; }
 .comparison-findings { margin: 0; }
 .comparison-findings small { display: block; }
 .text-button { padding: 0; border: 0; background: transparent; text-align: left; color: var(--green); text-decoration: underline; cursor: pointer; }

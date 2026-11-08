@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from service.extraction import (
     LINE_FIELDS, TERM_FIELDS, ExtractionError, add_term, make_line, render_page,
-    word_anchor, words_in_span,
+    pdf_term, term_from_cells, word_anchor, words_in_span,
 )
 from service import inference
 from service.ollama import InferenceError
@@ -44,6 +44,7 @@ HOSTED_INSTRUCTIONS = (
     "Return one JSON object. Use ONLY exact IDs from elements (for example e5), never printed row numbers, "
     "text, or page numbers, in evidence, origin and element. Evidence is a list of IDs for the document heading, "
     "or empty if there is no heading in this window. Each field entry contains field, element and verbatim value. "
+    "For dates and durations, copy the whole clause including calendar or business basis, trigger, cutoff and conditions. "
     "Keep rationale under 15 words. Avoid duplicate rows and terms."
 )
 NUMERIC_TOKEN = re.compile(r"(?<![\w.,])(?:(?:PHP\.?|₱)\s*)?-?\d[\d,]*(?:\.\d+)?(?!\w|[.,]\d)", re.I)
@@ -103,7 +104,30 @@ def resolve(citation, elements, *, numeric=False):
         value = numbers[0].group()
     # Keep the original parser coordinates. The association still needs review.
     resolved = word_anchor(anchor["source"], words_in_span(words, start, end)) if words else anchor
-    return row, {**resolved, "weak": True, "method": "model"}, value
+    return row, {**resolved, "weak": True, "method": "model",
+                 "quality_reason": resolved.get("quality_reason") or "Check the suggested value’s field association."}, value
+
+
+def labeled_term(citation, elements, source):
+    index, origin, _ = elements[citation.element]
+    row = [(anchor, words) for at, anchor, words in elements.values()
+           if at == index and anchor["source"] == origin["source"]]
+    values = []
+    for anchor, words in row:
+        if term := pdf_term(anchor["text"]):
+            field, value, span = term
+            values.append((field, value, word_anchor(source, words_in_span(words, *span)) if words else anchor))
+    if origin.get("cells"):
+        cells = [(anchor["text"], anchor["cells"][0]) for anchor, _ in row if anchor.get("cells")]
+        by_cell = {anchor["cells"][0]: anchor for anchor, _ in row if anchor.get("cells")}
+        if term := term_from_cells(cells, lambda selected: by_cell[selected[-1][1]]):
+            values.append(term)
+    literal = r"\s+".join(re.escape(part) for part in citation.value.split())
+    labeled = [(field, value, anchor) for field, value, anchor in values
+               if re.search(r"(?<![\w.,])" + literal + r"(?!\w|[.,]\d)", value, re.I)]
+    if not labeled:
+        return None
+    return next((item for item in labeled if item[0] == citation.field), labeled[0])
 
 
 def reconcile(result, elements, source, *, hosted=False):
@@ -116,7 +140,15 @@ def reconcile(result, elements, source, *, hosted=False):
     terms = []
     for citation in result.terms:
         _, anchor, value = resolve(citation, elements, numeric=decimal_value(citation.value) is not None)
-        terms.append((citation.field, value, anchor))
+        field = citation.field
+        if labeled := labeled_term(citation, elements, source):
+            actual, verbatim, source_anchor = labeled
+            if actual != field and {actual, field} != {"tax", "tax_declaration"}:
+                raise InferenceError(f"The cited {field.replace('_', ' ')} value belongs to a different labeled field.")
+            if not source_anchor.get("weak"):
+                anchor = {**source_anchor, "method": "model", "weak": False}
+            field, value = actual, verbatim
+        terms.append((field, value, anchor))
     rows = {}
     for material in result.rows:
         if material.origin not in elements or len({citation.field for citation in material.fields}) != len(material.fields):
@@ -138,6 +170,8 @@ def reconcile(result, elements, source, *, hosted=False):
             row, anchor, value = resolve(citation, elements, numeric=numeric)
             if abs(row - origin) > 1:
                 raise InferenceError("AI model returned an invalid or unrelated material value.")
+            if field in {"unit", "material_unit"} and re.search(r"\s\d[\d,.]*\b", value):
+                raise InferenceError("The cited unit includes a quantity or price.")
             fields[field], anchors[field] = value, anchor
         rows[origin] = make_line(source, origin, fields, anchors)
         if hosted:
@@ -151,6 +185,7 @@ def reconcile_hosted(result, window, ref):
     rejected = len(result.evidence) - len(evidence)
     empty = result.model_copy(update={"role": "unknown", "evidence": [], "rows": [], "terms": []})
     rows, terms, seen = {}, [], set()
+    term_warnings = []
     for material in result.rows:
         try:
             checked, _ = reconcile(empty.model_copy(update={"rows": [material]}), window, ref, hosted=True)
@@ -167,12 +202,14 @@ def reconcile_hosted(result, window, ref):
             continue
         try:
             _, checked = reconcile(empty.model_copy(update={"terms": [term]}), window, ref, hosted=True)
-        except InferenceError:
+        except InferenceError as exc:
             rejected += 1
+            if "different labeled field" in str(exc):
+                term_warnings.append(str(exc))
             continue
         seen.add(term.field)
         terms.extend(checked)
-    return rows, terms, evidence, rejected
+    return rows, terms, evidence, rejected, term_warnings
 
 
 def source_elements(source, pdf_words, *, hosted=False):
@@ -209,6 +246,8 @@ def assist(snapshot, path, directory, pdf_words, classification, on_inference):
         lines_by_source.setdefault(source, {})[line["id"]] = line
     pending = []
     for source in snapshot["sources"]:
+        if source.get("bundle_mark", {}).get("skip_offer"):
+            continue
         if source.get("schedule") and not hosted:
             continue
         rows = lines_by_source.get(source["ref"], {})
@@ -279,9 +318,11 @@ def assist(snapshot, path, directory, pdf_words, classification, on_inference):
                 }, images=images, retries=1, tokens=8192 if hosted else 2048, **options)
                 evidence = result.evidence
                 if hosted:
-                    rows, terms, evidence, discarded = reconcile_hosted(result, window, ref)
+                    rows, terms, evidence, discarded, term_warnings = reconcile_hosted(result, window, ref)
                     rejected += discarded
                     accepted += len(rows) + len(terms)
+                    if term_warnings:
+                        source["warning"] = source["warning"] or term_warnings[0]
                     if discarded and not native and not classification.get("summary_only"):
                         source["warning"] = source["warning"] or "Some suggested values could not be located on this page. Review the original."
                 else:
@@ -294,9 +335,12 @@ def assist(snapshot, path, directory, pdf_words, classification, on_inference):
                 for field, value, anchor in terms:
                     if hosted and source.get("schedule"):
                         continue
-                    if hosted and classification["role"] != "bom" and field == "supplier" and result.role == "quote" and evidence and not source.get("offer_issuer"):
+                    if (hosted and classification["role"] not in {"bom", "boq", "buyer"} and field == "supplier"
+                            and result.role == "quote" and evidence and not anchor.get("weak")
+                            and not source.get("offer_issuer")):
                         source["offer_issuer"] = value
-                    if not any(item["value"] == value for item in snapshot["term_mentions"].get(field, [])):
+                    if not any(item["value"] == value and all(item["anchor"].get(key) == anchor.get(key)
+                               for key in ("source", "cells", "boxes")) for item in snapshot["term_mentions"].get(field, [])):
                         add_term(snapshot, (field, value, anchor))
                 for line in rows.values():
                     existing = native.get(line["id"])
