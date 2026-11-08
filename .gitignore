@@ -39,3 +39,9 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Local procurement data and Python tooling
+/.suriq/
+/.venv/
+__pycache__/
+.pytest_cache/
