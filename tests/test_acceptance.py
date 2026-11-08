@@ -281,3 +281,18 @@ def test_weak_ocr_creates_source_review(tmp_path, monkeypatch):
         assert issue["review_required"] and not issue["confirmable"]
         assert issue["evidence"][0]["document"] == quote and issue["evidence"][0]["source"] == 1
         assert view["comparison"][0]["total"] is None
+
+
+def test_unlabeled_roles_follow_contents_and_multiple_boms_block(tmp_path):
+    with TestClient(create_app(tmp_path / "test.sqlite")) as client:
+        batch = create(client)
+        route = f"/batches/{batch}/documents"
+        ok(client.post(route, files={"file": ("quote.pdf", pdf([BOM]))}))
+        ok(client.post(route, files={"file": ("BOM.xlsx", xlsx([OFFER], [*TERMS, "Supplier: Steel Co"]))}))
+        view = ok(client.get(f"/batches/{batch}"))
+        assert [(doc["role"], doc["name"]) for doc in view["documents"]] == [
+            ("bom", "quote.pdf"), ("quote", "BOM.xlsx")]
+        assert view["documents"][1]["supplier"] == "Steel Co"
+        ok(client.post(route, files={"file": ("other.xlsx", xlsx([BOM]))}))
+        blocked = client.post(f"/batches/{batch}/verify")
+        assert blocked.status_code == 409 and "Multiple BOMs" in blocked.json()["detail"]

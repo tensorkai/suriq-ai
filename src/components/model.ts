@@ -12,10 +12,14 @@ export type Source = {
 };
 export type Line = {
   id: string; fields: Record<string, string>; anchors: Record<string, Anchor>;
-  original: string; match?: string; factor?: string;
+  original: string; match?: string; factor?: string; excluded?: boolean;
 };
 export type Document = {
-  id: string; name: string; kind: "pdf" | "xlsx"; role: "bom" | "quote"; supplier: string;
+  id: string; name: string; kind: "pdf" | "xlsx" | "docx"; role: "bom" | "quote" | "unknown" | "mixed" | "unsupported";
+  summary_only?: boolean; parser_update_available?: boolean;
+  classification?: { role: string; basis: string; evidence: Anchor[] };
+  provenance?: { parser: string; provider?: string; model?: string; model_digest?: string; inference: string };
+  intake: string; supplier: string; processing_step: string; revises: string | null; superseded_by: string | null;
   status: "ready" | "processing" | "needs_review" | "failed"; coverage: Coverage; error: string;
   lines: Line[]; sources: Source[]; terms: Record<string, string>; term_anchors: Record<string, Anchor>;
 };
@@ -32,9 +36,12 @@ export type Comparison = {
   items: Record<string, { state: string; offers: Record<string, string>[] }>;
 };
 export type AuditEvent = { id: number; action: string; actor: string; created: string; data: unknown };
+export type AIStatus = { provider: string; configured: boolean };
+
 export type Batch = {
+  ai: AIStatus;
   id: string; name: string; project: string; project_name: string; verified_at: string | null; stale: number;
-  scope_mode: Scope; scope: string[]; documents: Document[]; issues: Issue[]; comparison: Comparison[];
+  verification_problem: string; scope_mode: Scope; scope: string[]; documents: Document[]; issues: Issue[]; comparison: Comparison[];
   matches: Record<string, { bom: string | null; candidates: string[]; method: string }>;
   history: AuditEvent[];
 };
@@ -52,7 +59,10 @@ export const termFields: Record<string, string> = {
   supplier: "Supplier shown on source", reference: "Quote reference", quote_date: "Quote date",
   validity: "Validity / expiry", currency: "Currency", delivery: "Delivery / needed by", payment: "Payment terms",
   freight: "Freight", charges: "Additional charges", discount: "Discount", tax: "VAT basis",
-  vat: "VAT amount", subtotal: "Subtotal", total: "Payable total",
+  vat: "VAT amount", subtotal: "Subtotal", total: "Stated quotation total",
+  materials_total: "Stated materials total", item_extensions_total: "Sum of BOM item extensions",
+  labor_equipment: "Labor and equipment", mobilization: "Mobilization and consumables",
+  advance_payment: "Advance payment", balance_payment: "Balance payment", draft_notice: "Issuance status",
 };
 
 export const reviews: Record<ReviewStatus, string> = {
@@ -60,7 +70,11 @@ export const reviews: Record<ReviewStatus, string> = {
 };
 
 export function docName(doc: Document) {
-  return doc.role === "bom" ? "Bill of materials" : doc.supplier;
+  if (doc.role === "bom") return "Bill of materials";
+  if (doc.role === "quote") return doc.supplier;
+  if (doc.role === "mixed") return "Mixed document";
+  if (doc.role === "unsupported") return "Unsupported document";
+  return doc.status === "processing" ? "Identifying document" : "Type needs review";
 }
 
 export function sourceName(source: number | string) {

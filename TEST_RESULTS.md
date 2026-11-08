@@ -1,57 +1,53 @@
-# SuriQ AI test results
+# SuriQ AI v2 test results
 
-Executed on 7 November 2026 in Fedora Linux 44, on an AMD Ryzen 5 5625U host with 12 logical CPUs and 22 GiB of visible RAM. The environment used Node.js 24.18.0, Python 3.14.8, Poppler 26.01.0, Tesseract 5.5.4, and Chromium 156. Ollama was disabled during acceptance and browser testing.
+Executed on 8 November 2026 on Fedora Linux 44, AMD Ryzen 5 5625U, 12 logical CPUs, and 22 GiB RAM. The test stack used Python 3.14, Node.js 24, Poppler 26.01, Tesseract 5.5.4, LibreOffice Writer, and Chromium. All documents in this run were synthetic fixtures.
 
-## Release checklist
+## PRD v2 acceptance checklist
 
-The API suite generates the original PDFs and spreadsheets and exercises the same intake and verification code as the application. These results apply to the generated fixtures.
-
-| Test | Result | Evidence |
+| Test | Result | Observed behavior |
 | --- | --- | --- |
-| AT-01 | Pass | One BOM and three assigned multi-page supplier PDFs imported and extracted. |
-| AT-02 | Pass | One dimension issue links BOM page 2, Supplier A page 3, and Supplier B page 1. Chromium displayed all three full pages with original-text overlays. |
-| AT-03 | Pass | Quantity discrepancy appears as a separate keyboard-navigable tab. |
-| AT-04 | Pass | Ten of 100 BOM items selected. The other 90 caused no missing-material findings. |
-| AT-05 | Pass | A partial offer lacking a selected item displays “not offered.” |
-| AT-06 | Pass | XLSX evidence points to B2 and OCR evidence has PDF rectangles. A stricter confidence threshold exercised the weak-OCR source review state. |
-| AT-07 | Pass | Documented 40 kg and 50 kg pack sizes are flagged separately from an unknown pack size. |
-| AT-08 | Pass | Explicit inclusive and exclusive VAT yield distinct payable totals. Missing freight blocks comparability. Ambiguous and contradictory tax declarations stay unknown. |
-| AT-09 | Pass | Wrong subtotal and absent required grade generate source-linked findings. |
-| AT-10 | Pass | A correction removes one supplier's evidence from the dimension issue. The remaining issue can be dismissed, and the correction and review are audited. Chromium verified persistence after reload. |
-| AT-11 | Pass | A blank scanned page remains viewable and is flagged. Confirmation is rejected when required evidence is absent. |
-| AT-12 | Pass | A partial offer with unknown freight stays incomparable. Only documented comparable totals are ranked. |
+| AT-01 | Pass | One browser action uploaded a three-page BOM and three multi-page quotations without role selection. All four were identified from content. |
+| AT-02 | Pass | A BOM named `quote.pdf` and a quotation named `BOM.xlsx` received the correct roles. |
+| AT-03 | Pass | A title-free BOM with reordered columns, merged headings, and two worksheets mapped quantity evidence to each original C3 cell. |
+| AT-04 | Pass | A PDF with a letterhead, continued table, and footnote terms produced two anchored rows and page-two validity evidence. |
+| AT-05 | Pass with review | Actual Tesseract OCR processed a scan with irregular alignment. Intake left unsupported fields unresolved and the original page viewable. A separate scan produced precise OCR boxes. |
+| AT-06 | Pass | A DOCX quotation provided terms from paragraphs, line evidence from its original table cell, and a locally rendered PDF preview. |
+| AT-07 | Pass | Two different BOMs blocked verification with a multiple-BOM message and preserved both originals. |
+| AT-08 | Pass | A blank workbook and invoice produced unknown and unsupported states respectively. Quotations did not become the baseline. |
+| AT-09 | Pass with review | A combined requirements-and-offer packet stayed mixed until an audited role correction. The reviewer could exclude reference rows and retain the original. |
+| AT-10 | Pass | Simulated Ollama unavailability, malformed JSON, nonexistent element IDs, and fabricated values produced review states and retained retry/manual paths. |
+| AT-11 | Pass | An exceptional BOM-to-quotation override preserved the original decision and its reason, revalidated the batch, and included the corrected offer in comparison. |
+| AT-12 | Pass | Chromium showed one dimension issue with three original PDF page cards and six source-word rectangles. |
+| AT-13 | Pass | The independent quantity discrepancy appeared in a separate keyboard-navigable tab. |
+| AT-14 | Pass | Separate groups were created for 12 mm and 10 mm offers against 16 mm requirements. |
+| AT-15 | Pass | Selecting 10 of 100 BOM rows produced no missing findings for the other 90. |
+| AT-16 | Pass | A partial offer was shown as not offered for an omitted item. An unknown packaging factor was left for clarification. |
+| AT-17 | Pass | A one-cent line error was recomputed with Decimal and linked to quantity, price, and amount cells. Ambiguous VAT left the offer incomparable. |
+| AT-18 | Pass | A simulated model-supplied box was rejected by schema validation. Accepted model values used parser-owned coordinates and remained reviewable. |
+| AT-19 | Pass | A scan reading was linked to its visible region, manually matched, and reverified. The reviewer decision and correction history persisted. |
+| AT-20 | Pass | Partial coverage and undocumented freight prevented comparable totals. |
+| AT-21 | Pass on synthetic fixtures | The production browser workflow and an installed Qwen3-VL intake smoke test both ran in network namespaces with only loopback. The model-assisted document remained reviewable and the viewer and CSV export worked offline. |
+| AT-22 | Pass | Invalid signatures, legacy formats, and duplicate hashes were rejected. A corrupt PDF retained its original and recoverable status. A revision preserved the original and only the current offer participated in comparison. |
 
-Additional regression checks cover file signature and duplicate rejection, original persistence and deletion, interrupted extraction retry, oversized sparse workbooks, PDF rotation, and large decimal values. The browser workflow also checked synchronized focus, PDF/CSV downloads, cross-origin rejection, the write-intent check, and a 390 px viewport.
+## Commands and scope
 
-## Commands
-
-The API and regression suite passed all 13 tests in 4.93 s. ESLint, Next route type generation, TypeScript, the production build, dependency consistency, and the production Chromium workflow also passed.
-
-From the repository root after installing `requirements-dev.txt` and system OCR dependencies:
-
-```sh
-.venv/bin/python -m pytest -q
-npm run lint
-npm run typecheck
-npm run build
-.venv/bin/python -m pip check
-```
-
-For the browser test, start both services with an isolated `SURIQ_DB`. Install the test browser with `.venv/bin/python -m playwright install chromium`, then run:
-
-```sh
-SURIQ_TEST_URL=http://127.0.0.1:3000 .venv/bin/python -m tests.browser_workflow
-```
-
-The executed production run used port 3100 and an existing Chromium executable selected via `SURIQ_CHROMIUM`. The browser test creates synthetic data in the configured workspace.
+- `.venv/bin/python -m pytest -q` passed all 28 acceptance and regression tests with Tesseract and LibreOffice available. Model error cases use deliberately controlled responses. Native PDF, OCR, XLSX, DOCX, SQLite, and reports ran through the actual local API.
+- `npm run lint`, `npm run typecheck`, `npm run build`, `.venv/bin/python -m pip check`, and `git diff --check` passed.
+- `.venv/bin/python -m tests.browser_workflow` passed against the production Next.js build with a separate database. It checked unlabeled mixed upload, grouped evidence, keyboard focus, correction, review persistence, comparison, downloads, request restrictions, and a 390 px viewport.
+- `.venv/bin/python -m tests.live_model` passed with Ollama 0.40.15 and Qwen3-VL 4B Instruct on CPU in 93.0 s. The model read an unfamiliar PDF quotation and supplied source-linked material, quantity, unit price, and line amount. It omitted a standalone unit field, so the line remained flagged and the offer remained incomparable. Earlier runs either timed out or returned unusable citations and correctly retained the original for review.
 
 ## Synthetic throughput
 
-`.venv/bin/python -m tests.benchmark` generated one BOM and three 10-page quotations, with one material row per page. Both runs checked all 40 pages and rows and one dimension issue with three linked sources. Timings include API intake, extraction, scope update, and verification. Fixture creation is excluded.
+`.venv/bin/python -m tests.benchmark` processed four 10-page documents in a loopback-only namespace with model assistance disabled. Both runs recovered 40 material rows and one dimension issue across three sources. Measured upload-to-verification time was 0.27 s for native PDFs and 18.18 s for scanned PDFs. Fixture generation was excluded.
 
-| Format | Upload to findings |
-| --- | ---: |
-| Native text PDFs | 0.40 s |
-| Scanned PDFs, all 40 pages OCR'd | 25.11 s |
+## Open release gates
 
-The PRD accuracy and performance release gates still need a human-labeled supplier corpus and benchmarking on its reference device. Live Qwen inference, Windows/WSL2, additional browser engines, and commercial distribution review were outside this verification run.
+A single synthetic run cannot establish the PRD's real-world macro-F1, field precision and recall, or evidence accuracy targets. The labeled supplier corpus, adjudication, reference-device AI benchmark, and pilot sign-off remain open.
+
+## Gemini provider
+
+The full API suite passed 31 tests. The Gemini tests intercepted the HTTPS transport to verify image and JSON-schema requests, opt-in on retry, parser-owned anchors, rate-limit handling, and local enforcement of output bounds. The production Chromium workflow passed with Gemini selected and native extraction. The authenticated synthetic Gemini smoke test passed in 1.9 s and recovered the item code, material, quantity, unit, unit price, and amount with source evidence. It also verified guarded comparison, PDF preview, and CSV export.
+
+## Summary-only PDF quotations
+
+The full API regression suite passed 32 tests. The added synthetic case covers centered headers, right-aligned prices, a draft quotation with only summary amounts, and suppression of item findings and partial-scope comparisons. The supplied PDF pair was reprocessed locally in the running app. All 36 BOM rows summed to PHP 386,938.68, and the quotation stated PHP 387,337.68 for materials. Chromium displayed the PHP 399.00 finding with highlights on BOM page 2 and quotation page 1. CSV export passed. Item coverage remained unverified.

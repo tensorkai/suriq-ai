@@ -13,7 +13,9 @@ export function SupplierComparison({ batch }: { batch: Batch }) {
   const bom = batch.documents.find((doc) => doc.role === "bom");
   const rows = bom?.lines.filter((line) => batch.scope_mode === "all" ||
     (batch.scope_mode === "selected" && batch.scope.includes(line.id))) ?? [];
-  const terms = ["quote_date", "reference", "freight", "charges", "discount", "vat", "delivery", "validity", "payment"];
+  const summaryTerms = ["materials_total", "labor_equipment", "mobilization", "total", "advance_payment", "balance_payment", "draft_notice"]
+    .filter((field) => suppliers.some((row) => row.terms[field]));
+  const terms = [...summaryTerms, "quote_date", "reference", "freight", "charges", "discount", "vat", "delivery", "validity", "payment"];
   return <section className="comparison">
     <div className="detail-heading"><div><span className="eyebrow">SUPPLIER MATRIX</span><h2>Offer comparison</h2>
       <p>Totals are shown where purchase coverage, specifications, and documented cost basis align.</p></div></div>

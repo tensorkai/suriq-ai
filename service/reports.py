@@ -22,11 +22,26 @@ def report_rows(batch):
     yield ("Basis", "Metric conversions use defined factors. Packaging uses explicit evidence or a reviewer factor.")
     yield ("Basis", "Verification is for human review before purchase approval.")
     for doc in batch["documents"]:
-        yield ("Document", doc["name"], doc["role"], doc["supplier"], doc["digest"], doc["status"])
+        status = "Superseded" if doc["superseded_by"] else doc["status"]
+        yield ("Document", doc["name"], doc["role"], doc["supplier"], doc["digest"], status)
+        if doc["revises"]:
+            yield ("Revision", doc["name"], docs.get(doc["revises"], "Previous revision"))
         for line in doc["lines"]:
-            if line.get("factor"):
+            if line.get("factor") and not line.get("excluded") and not doc["superseded_by"]:
                 yield ("Conversion", doc["name"], line["fields"].get("code", line["id"]),
                        f"{line['factor']} BOM units per quoted unit")
+    for entry in batch["history"]:
+        data = entry["data"]
+        if entry["action"] in {"correct_line", "correct_terms", "add_line", "correct_role"}:
+            after = data.get("after", {})
+            if isinstance(after, dict):
+                changes = ", ".join(f"{field} = {value}" for field, value in after.get("values", {}).items())
+                if "excluded" in after:
+                    changes = f"{changes} · Row {'excluded' if after['excluded'] else 'restored'}".strip(" ·")
+            else:
+                changes = f"Type set to {after}"
+            yield ("Correction", docs.get(data["document"], ""), data.get("target", ""), entry["created"],
+                   changes, data.get("note") or data.get("reason", ""))
     for supplier in batch["comparison"]:
         yield ("Supplier", supplier["supplier"], supplier["coverage"], supplier["tax_basis"],
                f"{supplier['currency']} {supplier['total']}" if supplier["total"] is not None else "Incomparable",

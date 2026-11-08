@@ -11,8 +11,8 @@ import type { Link } from "./viewer";
 const statusLabel = { ready: "Ready", processing: "Processing", needs_review: "Needs review", failed: "Failed" };
 const coverageLabel = { full: "Full scope", partial: "Partial offer", unknown: "Coverage unknown" };
 
-export function Documents({ batch, update, upload, manage }: {
-  batch: Batch; update: (value: Batch) => void; upload: () => void; manage: (doc: Document) => void;
+export function Documents({ batch, update, upload, revise, manage }: {
+  batch: Batch; update: (value: Batch) => void; upload: () => void; revise: (doc: Document) => void; manage: (doc: Document) => void;
 }) {
   const [selected, select] = useState("");
   const [mode, setMode] = useState<"extraction" | "source" | "terms">("extraction");
@@ -21,12 +21,17 @@ export function Documents({ batch, update, upload, manage }: {
   const [scope, setScope] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const gemini = batch.ai.provider === "gemini";
   const doc = batch.documents.find((item) => item.id === selected) ?? batch.documents[0];
-  const bom = batch.documents.find((item) => item.role === "bom");
-  const count = batch.scope_mode === "all" ? bom?.lines.length ?? 0 : batch.scope.length;
+  const boms = batch.documents.filter((item) => item.role === "bom");
+  const bom = boms.length === 1 ? boms[0] : undefined;
+  const revisedFrom = batch.documents.find((item) => item.id === doc?.revises);
+  const revisedTo = batch.documents.find((item) => item.id === doc?.superseded_by);
+  const pendingRevision = batch.documents.some((item) => item.revises === doc?.id);
+  const count = batch.scope_mode === "all" ? bom?.lines.filter((line) => !line.excluded).length ?? 0 : batch.scope.length;
 
   if (!doc) return <Empty icon={<UploadCloud size={27} />} title="Upload your first source">
-    <p>Start with a bill of materials. Then add up to five supplier quotations in PDF or XLSX format.</p>
+    <p>Add a bill of materials and up to five supplier quotations together in PDF, XLSX, or DOCX format.</p>
     <button className="button primary" type="button" onClick={upload}><Plus size={16} /> Upload documents</button>
   </Empty>;
 
@@ -39,6 +44,20 @@ export function Documents({ batch, update, upload, manage }: {
     } finally { setBusy(false); }
   }
 
+  async function retryExtraction(useGemini: boolean) {
+    const data = new FormData();
+    if (useGemini) {
+      if (!window.confirm("Allow Gemini to receive excerpts and page images from this non-confidential file?")) return;
+      data.append("use_gemini", "true");
+    }
+    setBusy(true); setError("");
+    try {
+      await api(`/documents/${doc.id}/retry`, "POST", data);
+      update(await api<Batch>(`/batches/${batch.id}`));
+    } catch (error) { setError((error as Error).message); }
+    finally { setBusy(false); }
+  }
+
   return <div className="documents-layout">
     <aside className="document-rail">
       <div className="issue-rail-heading"><span>SOURCE FILES</span><span>{batch.documents.length}</span></div>
@@ -46,36 +65,72 @@ export function Documents({ batch, update, upload, manage }: {
         type="button" aria-current={doc.id === item.id ? "true" : undefined}
         onClick={() => { select(item.id); setMode("extraction"); setError(""); }}>
         <span className={`file-glyph ${item.role}`}><FileText size={17} /></span>
-        <span><strong>{docName(item)}</strong><small>{item.name}</small><span className="document-status">{statusLabel[item.status]}</span></span>
+        <span><strong>{docName(item)}</strong><small>{item.name}</small><span className="document-status">{item.superseded_by ? "Superseded" : item.processing_step || statusLabel[item.status]}</span></span>
       </button>)}
       <button className="button secondary full" type="button" onClick={upload}><Plus size={15} /> Add document</button>
     </aside>
     <section className="document-detail">
       <div className="detail-heading">
-        <div><div className="inline"><span className="eyebrow">{doc.role === "bom" ? "REQUIREMENTS" : "SUPPLIER OFFER"}</span>
-          <Pill value={statusLabel[doc.status]} /></div>
-          <h2>{docName(doc)}</h2><p>{doc.name} · {doc.sources.length} {doc.kind === "pdf" ? "pages" : "worksheets"}</p>
+        <div><div className="inline"><span className="eyebrow">{doc.role === "bom" ? "REQUIREMENTS" : doc.role === "quote" ? "SUPPLIER OFFER" : "INTAKE REVIEW"}</span>
+          <Pill value={revisedTo ? "Superseded" : doc.processing_step || statusLabel[doc.status]} /></div>
+          <h2>{docName(doc)}</h2><p>{doc.name} · {doc.sources.length} {doc.kind === "pdf" ? "pages" : doc.kind === "docx" ? "sections" : "worksheets"}</p>
         </div>
         <button className="button secondary" type="button" onClick={() => manage(doc)}>Manage file</button>
       </div>
       <div className="detail-settings">
         {doc.role === "bom" ? <div className="inline">
           <span className="muted">Purchase scope</span><Pill value={batch.scope_mode === "unknown" ? "Unset" : `${count} selected`} />
-          <button className="button secondary" type="button" disabled={!bom?.lines.length} onClick={() => setScope(true)}>Set scope</button>
-        </div> : <label className="inline">Supplier coverage<select disabled={busy} value={doc.coverage}
+          <button className="button secondary" type="button" disabled={!bom?.lines.some((line) => !line.excluded) || bom.status === "processing"}
+            onClick={() => setScope(true)}>Set scope</button>
+        </div> : doc.role === "quote" && !revisedTo ? <label className="inline">Supplier coverage<select disabled={busy} value={doc.coverage}
           onChange={(event) => void changeCoverage(event.target.value as Coverage)}>
           {Object.entries(coverageLabel).map(([value, label]) => <option value={value} key={value}>{label}</option>)}
-        </select></label>}
-        {(doc.status === "failed" || doc.status === "needs_review") && <button className="button secondary" type="button"
-          disabled={busy} onClick={async () => {
-            setBusy(true); setError("");
-            try {
-              await api(`/documents/${doc.id}/retry`, "POST");
-              update(await api<Batch>(`/batches/${batch.id}`));
-            } catch (error) { setError((error as Error).message); }
-            finally { setBusy(false); }
-          }}><RotateCcw size={15} /> Retry extraction</button>}
+        </select></label> : null}
+        {doc.role === "quote" && !pendingRevision && doc.status !== "processing" &&
+          <button className="button secondary" type="button" onClick={() => revise(doc)}>Upload revision</button>}
+        {(doc.status === "failed" || doc.status === "needs_review" || doc.parser_update_available) &&
+          <button className="button secondary" type="button" disabled={busy} onClick={() => void retryExtraction(false)}>
+            <RotateCcw size={15} /> {doc.parser_update_available ? "Reprocess PDF" : "Retry extraction"}
+          </button>}
+        {gemini && batch.ai.configured && (doc.status === "failed" || doc.status === "needs_review") &&
+          <button className="button secondary" type="button" disabled={busy} onClick={() => void retryExtraction(true)}>
+            Retry with Gemini
+          </button>}
       </div>
+      {revisedFrom && <p className="notice">Revision of {revisedFrom.name}.</p>}
+      {revisedTo && <p className="notice">Superseded by {revisedTo.name}.</p>}
+      {doc.classification && <details className="notice">
+        <summary>{doc.intake === "override" ? "Type corrected by reviewer" : "Classification evidence"}</summary>
+        <p>{doc.classification.basis}</p>
+        {doc.classification.evidence?.map((anchor, index) =>
+          <p key={index}>{sourceName(anchor.source)} · {anchor.text}</p>)}
+        {doc.provenance?.model && <p>{doc.provenance.provider === "gemini" ? "Hosted model" : "Local model"} {doc.provenance.model} · {doc.provenance.inference}</p>}
+      </details>}
+      {doc.status !== "processing" && doc.status !== "failed" && doc.role !== "unsupported" && !revisedTo && <details className="notice"
+        open={doc.role === "unknown" || doc.role === "mixed" ? true : undefined}>
+        <summary>Correct type</summary>
+        <form className="stack" key={doc.id} onSubmit={async (event) => {
+          event.preventDefault();
+          const data = new FormData(event.currentTarget);
+          try { update(await api<Batch>(`/documents/${doc.id}/role`, "PATCH", data)); setError(""); }
+          catch (error) { setError((error as Error).message); }
+        }}>
+          <label>Document type<select name="role" defaultValue={doc.role === "quote" ? "quote" : "bom"}>
+            <option value="bom">Bill of materials</option><option value="quote">Supplier quotation</option>
+          </select></label>
+          <label>Supplier name for quotations<input name="supplier" defaultValue={doc.supplier} maxLength={120} /></label>
+          {doc.role === "mixed" && doc.lines.length > 0 && <fieldset className="scope-checks">
+            <legend>Exclude rows from reference sections</legend>
+            {doc.lines.filter((line) => !line.excluded).map((line) => <label key={line.id} className="inline">
+              <input type="checkbox" name="exclude_rows" value={line.id} />
+              {line.id} · {line.fields.material || line.fields.description}
+            </label>)}
+          </fieldset>}
+          <label>Reason for correction<input name="reason" maxLength={500} required /></label>
+          <button type="submit" className="button secondary">Save type correction</button>
+        </form>
+      </details>}
+      {doc.terms.draft_notice && <p className="notice">Source marked draft or not issued. Confirm figures with the vendor before procurement.</p>}
       {doc.error && <p className="notice" role="status">{doc.error}</p>}
       {error && <p className="error" role="alert">{error}</p>}
       <nav className="segment" aria-label="Document view">
@@ -106,14 +161,18 @@ export function Documents({ batch, update, upload, manage }: {
             const bomLine = bom?.lines.find((candidate) => candidate.id === match?.bom);
             return <tr key={line.id}><td className="mono">{f.code || line.id}</td>
               <td><strong>{f.material || f.description || "Unnamed row"}</strong>
-                <small>{[f.specification, f.pack].filter(Boolean).join(" · ")}</small>
+                <small>{[line.excluded ? "Excluded from verification" : "", f.specification, f.pack,
+                  Object.values(line.anchors).some((item) => item.weak) ? "Source needs review" : ""].filter(Boolean).join(" · ")}</small>
                 {match && <small>Match {bomLine ? `· ${bomLine.fields.code || bomLine.id} · ${match.method}` : "needs review"}</small>}</td>
               <td className="mono">{f.quantity || "—"}</td><td>{f.unit || "—"}</td><td className="mono">{f.unit_price || "—"}</td>
               <td>{anchor ? <span className="source-ref">{sourceName(anchor.source)}{anchor.cells?.length ? ` · ${anchor.cells.join(", ")}` : ""}</span> : "Unlinked"}</td>
               <td><button className="icon-button" type="button" onClick={() => edit(line)}
                 aria-label={`Edit ${f.material || f.description || line.id}`}><Pencil size={15} /></button></td></tr>;
           })}</tbody>
-        </table></div> : <Empty icon={<FileText size={22} />} title={doc.status === "processing" ? "Extracting source" : "No material rows yet"}>
+        </table></div> : doc.summary_only ? <Empty icon={<FileText size={22} />} title="Summary quotation">
+          <p>Stated totals and terms are available. Item coverage, quantities and specifications are unverified.</p>
+          <button className="button secondary" type="button" onClick={() => setMode("terms")}>View document terms</button>
+        </Empty> : <Empty icon={<FileText size={22} />} title={doc.status === "processing" ? "Extracting source" : "No material rows yet"}>
           <p>{doc.status === "processing" ? "This view refreshes as extraction completes." : "Open the original source and add linked material rows where needed."}</p>
         </Empty>}
       </>}
@@ -144,7 +203,7 @@ function ScopeEditor({ batch, bom, update, close }: {
       <label>Scope<select aria-label="Scope" value={mode} onChange={(event) => setMode(event.target.value as Scope)}>
         <option value="unknown">Scope unknown</option><option value="all">All BOM items</option><option value="selected">Select individual items</option>
       </select></label>
-      {mode === "selected" && <div className="scope-checks">{bom.lines.map((line) => <label key={line.id} className="inline">
+      {mode === "selected" && <div className="scope-checks">{bom.lines.filter((line) => !line.excluded).map((line) => <label key={line.id} className="inline">
         <input type="checkbox" checked={rows.has(line.id)} onChange={(event) => {
           const next = new Set(rows);
           if (event.target.checked) next.add(line.id); else next.delete(line.id);
@@ -172,6 +231,7 @@ function FieldEditor({ doc, bom, batch, editor, update, close }: {
   const [match, setMatch] = useState(line?.match ?? "auto");
   const [factor, setFactor] = useState(line?.factor ?? "");
   const [note, setNote] = useState("");
+  const [excluded, setExcluded] = useState(Boolean(line?.excluded));
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [suggestion, setSuggestion] = useState("");
@@ -188,6 +248,7 @@ function FieldEditor({ doc, bom, batch, editor, update, close }: {
       event.preventDefault(); setError(""); setBusy(true);
       const changed = Object.fromEntries(Object.entries(values).filter(([key, value]) => value !== (initial[key] ?? "")));
       const payload: Record<string, unknown> = { values: changed, anchors: linked, note };
+      if (line && excluded !== Boolean(line.excluded)) payload.excluded = excluded;
       if (matching && match !== (line?.match ?? "auto")) payload.match = match === "auto" ? null : match;
       if (matching && factor !== (line?.factor ?? "")) payload.factor = factor;
       const path = terms ? "/terms" : line ? `/line/${encodeURIComponent(line.id)}` : "/lines";
@@ -205,24 +266,34 @@ function FieldEditor({ doc, bom, batch, editor, update, close }: {
             <button className={`icon-button ${field === key ? "active-link" : ""}`} type="button" title={`Link ${title} to source`}
               aria-label={`Link ${title} to source`} onClick={() => setField(key)}><Link2 size={16} /></button>
           </div>)}
+          {line && <label className="inline">
+            <input type="checkbox" checked={excluded} onChange={(event) => setExcluded(event.target.checked)} />
+            Exclude this source row from verification
+          </label>}
           {matching && <div className="stack">
             <label>Match to BOM<select value={match} onChange={(event) => setMatch(event.target.value)}>
               <option value="auto">Automatic{currentMatch?.bom ? ` · ${currentMatch.bom}` : ""}</option>
               <option value="">No BOM match</option>
-              {bom?.lines.map((candidate) => <option value={candidate.id} key={candidate.id}>
+              {bom?.lines.filter((candidate) => !candidate.excluded).map((candidate) => <option value={candidate.id} key={candidate.id}>
                 {candidate.fields.code || candidate.id} · {candidate.fields.material || candidate.fields.description}
               </option>)}
             </select></label>
             {currentMatch?.candidates.length ? <p className="fine-print">Candidates {currentMatch.candidates.join(", ")}</p> : null}
-            {line && <button className="button secondary" type="button" disabled={suggesting} onClick={async () => {
+            {line && <button className="button secondary" type="button"
+              disabled={suggesting || !batch.ai.configured} onClick={async () => {
+              const data = new FormData();
+              if (batch.ai.provider === "gemini") {
+                if (!window.confirm("Allow Gemini to receive these non-confidential BOM and quotation descriptions?")) return;
+                data.append("use_gemini", "true");
+              }
               setSuggesting(true);
               try {
                 const result = await api<{ candidates: string[]; message: string }>(
-                  `/documents/${doc.id}/line/${encodeURIComponent(line.id)}/suggest`, "POST");
+                  `/documents/${doc.id}/line/${encodeURIComponent(line.id)}/suggest`, "POST", data);
                 setSuggestion(`${result.message} ${result.candidates.join(", ")}`);
               } catch (error) { setSuggestion((error as Error).message); }
               finally { setSuggesting(false); }
-            }}>Suggest matches with local AI</button>}
+            }}>Suggest matches with {batch.ai.provider === "gemini" ? "Gemini" : "local AI"}</button>}
             {suggestion && <p className="notice" role="status">{suggestion}</p>}
             <label>BOM units per quoted unit<input value={factor} inputMode="decimal" placeholder="Only for a documented conversion"
               onChange={(event) => setFactor(event.target.value)} /></label>

@@ -26,23 +26,23 @@ def main():
         page.get_by_role("dialog").get_by_role("button", name="Create batch").click()
         expect(page.get_by_role("heading", name="Steel procurement")).to_be_visible()
 
-        def upload(filename, content, supplier=None):
-            page.get_by_role("button", name="Upload", exact=True).click()
-            dialog = page.get_by_role("dialog")
-            if supplier:
-                dialog.get_by_label("Supplier name").fill(supplier)
-                dialog.get_by_label("Supplier coverage").select_option("full")
-            dialog.locator("input[type=file]").set_input_files({
-                "name": filename, "mimeType": "application/pdf", "buffer": content,
-            })
-            dialog.get_by_role("button", name="Upload and extract").click()
-            expect(dialog).not_to_be_visible()
-
-        upload("BOM.pdf", pdf([BOM], page=2))
-        upload("A.pdf", pdf([OFFER], page=3, terms=TERMS), "Supplier A")
-        upload("B.pdf", pdf([OFFER], terms=TERMS), "Supplier B")
         third = ["B-014", "Deformed bar 16 mm Grade 60", "60", "pcs", "100", "6000"]
-        upload("C.pdf", pdf([third], page=4, pages=4), "Supplier C")
+        page.get_by_role("button", name="Upload", exact=True).click()
+        dialog = page.get_by_role("dialog")
+        expect(dialog.get_by_label("Document type")).to_have_count(0)
+        dialog.locator("input[type=file]").set_input_files([
+            {"name": filename, "mimeType": "application/pdf", "buffer": content}
+            for filename, content in (
+                ("quote.pdf", pdf([BOM], page=2)),
+                ("A.pdf", pdf([OFFER], page=3, terms=["Supplier: Supplier A", *TERMS])),
+                ("B.pdf", pdf([OFFER], terms=["Supplier: Supplier B", *TERMS])),
+                ("C.pdf", pdf([third], page=4, pages=4, terms=["Supplier: Supplier C"])),
+            )
+        ])
+        dialog.get_by_role("button", name="Upload and extract").click()
+        expect(dialog).not_to_be_visible()
+        expect(page.get_by_role("button", name="Supplier C")).to_be_visible()
+
         page.get_by_role("button", name="Set scope").click()
         page.get_by_role("dialog").get_by_label("Scope", exact=True).select_option("all")
         page.get_by_role("button", name="Save scope").click()
@@ -52,7 +52,7 @@ def main():
         dimension.click()
         expect(page.get_by_role("tab", name="Quantity mismatch")).to_have_count(1)
         expect(page.get_by_role("tabpanel").locator(".source-card")).to_have_count(3)
-        for file, number in (("BOM.pdf", 2), ("A.pdf", 3), ("B.pdf", 1)):
+        for file, number in (("quote.pdf", 2), ("A.pdf", 3), ("B.pdf", 1)):
             image = page.get_by_role("img", name=f"Full source Page {number} of {file}")
             image.scroll_into_view_if_needed()
             expect(image).to_be_visible()

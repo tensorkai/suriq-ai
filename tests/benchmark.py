@@ -11,7 +11,7 @@ from reportlab.pdfgen.canvas import Canvas
 
 from service.api import create_app
 from tests.fixtures import COLUMNS, HEADERS
-from tests.test_acceptance import create, ok, upload
+from tests.test_acceptance import create, ok
 
 
 def make_document(supplier):
@@ -26,7 +26,7 @@ def make_document(supplier):
         for x, value in zip(COLUMNS, row):
             canvas.drawString(x, 706, value)
         if page == 10 and supplier:
-            for index, term in enumerate(["Subtotal: 80000", "Tax: VAT inclusive", "Freight: Included",
+            for index, term in enumerate([f"Supplier: {supplier}", "Subtotal: 80000", "Tax: VAT inclusive", "Freight: Included",
                                           "Discount: None", "Total: 80000"]):
                 canvas.drawString(40, 660 - index * 18, term)
         canvas.showPage()
@@ -53,7 +53,8 @@ def benchmark(sources, directory, kind):
         batch = create(client)
         start = perf_counter()
         for supplier, content in sources.items():
-            upload(client, batch, f"{supplier or 'BOM'}.pdf", content, supplier)
+            ok(client.post(f"/batches/{batch}/documents",
+                           files={"file": (f"{supplier or 'BOM'}.pdf", content)}))
         ok(client.patch(f"/batches/{batch}/scope", json={"mode": "all"}))
         data = ok(client.post(f"/batches/{batch}/verify"))
         elapsed = perf_counter() - start

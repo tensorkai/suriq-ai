@@ -32,6 +32,7 @@ RULES = {
     "validity": "Quotation validity", "delivery": "Delivery requirement",
     "extraction": "Source needs review", "terms": "Conflicting quote terms",
     "supplier_duplicate": "Multiple offers from supplier", "outside_scope": "Item outside purchase scope",
+    "materials_summary": "Stated materials total difference",
 }
 
 
@@ -44,7 +45,7 @@ def compact(value):
 
 
 def decimal_value(value):
-    text = re.sub(r"^(?:PHP|₱)\s*", "", value.strip(), flags=re.I)
+    text = re.sub(r"^(?:PHP\.?|₱)\s*", "", value.strip(), flags=re.I)
     if not re.fullmatch(r"-?(?:\d{1,3}(?:,\d{3})+|\d{1,15})(?:\.\d{1,8})?", text):
         return None
     if len(text.replace(",", "")) > 22:
@@ -177,6 +178,20 @@ def charge(value):
     return decimal_value(value)
 
 
+def summary_quote(doc):
+    if doc["role"] != "quote" or doc["lines"] or not doc.get("classification", {}).get("summary_only"):
+        return False
+    return any((amount := decimal_value(doc["terms"].get(field, ""))) is not None and amount >= 0
+               and (anchor := evidence(doc, field=field)) and not anchor.get("weak")
+               for field in ("materials_total", "total"))
+
+
+def uncertain_source(doc):
+    return (any(source["warning"] for source in doc["sources"])
+            or any(anchor.get("weak") for anchor in doc["term_anchors"].values())
+            or any(anchor.get("weak") for line in doc["lines"] for anchor in line["anchors"].values()))
+
+
 def verify(documents, scope_mode, scope, as_of=None):
     with localcontext() as context:
         context.prec = 60
@@ -222,7 +237,13 @@ def verify_in_context(documents, scope_mode, scope, as_of):
                 add("extraction", doc["id"], source["ref"], source["warning"], "Warning",
                     [{"document": doc["id"], "source": source["ref"], "text": source["warning"], "weak": True}],
                     review=True)
-        if not doc["lines"]:
+        for line in doc["lines"]:
+            fields = line["fields"]
+            if not fields.get("unit") or decimal_value(fields.get("quantity", "")) is None:
+                add("extraction", [doc["id"], line["id"]], "quantity or unit",
+                    "Material row has a missing or unreadable quantity or unit.", "Warning",
+                    [evidence(doc, line)], review=True)
+        if not doc["lines"] and not summary_quote(doc):
             add("extraction", doc["id"], "no rows", "No material rows were recognized.", "Warning",
                 source_evidence(doc), review=True)
 
@@ -234,7 +255,8 @@ def verify_in_context(documents, scope_mode, scope, as_of):
 
     for quote in quotes:
         offered = defaultdict(list)
-        uncertain = not quote["lines"] or any(source["warning"] for source in quote["sources"])
+        summary = summary_quote(quote)
+        uncertain = not quote["lines"] or uncertain_source(quote)
         bad_lines = False
         line_amounts = []
         for line in quote["lines"]:
@@ -280,6 +302,9 @@ def verify_in_context(documents, scope_mode, scope, as_of):
             item = bf.get("code") or f"Row {key}"
             matched = offered[key]
             if not matched:
+                if summary:
+                    matrix[key] = {"state": "Not itemized", "offers": []}
+                    continue
                 coverage = quote["coverage"]
                 is_full = coverage == "full" and not uncertain
                 note = (f"{item} is absent from the full-scope offer." if is_full else
@@ -393,13 +418,17 @@ def verify_in_context(documents, scope_mode, scope, as_of):
             reasons.append("Commercial values lack reliable source evidence")
         if scope_mode == "unknown" or not required:
             reasons.append("Purchase scope is unset or empty")
-        if quote["coverage"] != "full":
+        if summary:
+            reasons.append("Summary quotation. Item coverage, quantities and specifications cannot be verified.")
+        elif quote["coverage"] != "full":
             reasons.append(f"Supplier coverage is {quote['coverage']}")
+        if terms.get("draft_notice"):
+            reasons.append("The source is marked draft or not issued.")
         if len(supplier_docs[norm(quote["supplier"])]) > 1:
             reasons.append("Multiple offers from this supplier need review")
-        if any(row["state"] != "pass" for row in matrix.values()):
+        if not summary and any(row["state"] != "pass" for row in matrix.values()):
             reasons.append("Scope, specifications or quantities are unresolved")
-        if uncertain or any(source["warning"] for source in bom["sources"]):
+        if (uncertain and not summary) or uncertain_source(bom):
             reasons.append("Extraction or line matching requires review")
         if scope_mode == "selected" and any(key not in required for key in offered):
             reasons.append("Quote includes items outside purchase scope")
@@ -412,6 +441,18 @@ def verify_in_context(documents, scope_mode, scope, as_of):
                     "Warning", [{**m["anchor"], "document": quote["id"]} for m in mentions], review=True)
 
         subtotal = decimal_value(terms.get("subtotal", ""))
+        if summary and scope_mode == "all" and quote["coverage"] != "partial":
+            expected_raw = bom["terms"].get("item_extensions_total", "")
+            stated_raw = terms.get("materials_total", "")
+            expected, stated = decimal_value(expected_raw), decimal_value(stated_raw)
+            anchors = [evidence(bom, field="item_extensions_total"), evidence(quote, field="materials_total")]
+            php = all(re.match(r"^(?:PHP\.?|₱)", value, re.I) for value in (expected_raw, stated_raw))
+            if (php and expected is not None and stated is not None and money(expected) != money(stated)
+                    and all(anchor and not anchor.get("weak") for anchor in anchors)
+                    and not bom.get("has_excluded_rows")):
+                add("materials_summary", quote["id"], [money(expected), money(stated)],
+                    f"Stated materials totals differ by PHP {money(abs(stated - expected))}. Confirm coverage and the source figures.",
+                    "Warning", anchors, review=True)
         computed = sum(line_amounts, Decimal(0))
         if bad_lines:
             reasons.append("One or more line amounts cannot be verified")
@@ -451,7 +492,7 @@ def verify_in_context(documents, scope_mode, scope, as_of):
 
         declared_total = decimal_value(terms.get("total", ""))
         payable = None
-        if not bad_lines and freight is not None and basis != "unknown":
+        if not summary and not bad_lines and freight is not None and basis != "unknown":
             base = computed + freight + (extra or 0) - (discount or 0)
             if basis == "VAT exclusive":
                 if vat is not None and vat >= 0:

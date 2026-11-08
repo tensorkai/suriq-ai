@@ -7,22 +7,25 @@ from tempfile import TemporaryDirectory
 from zipfile import BadZipFile, ZipFile
 
 from defusedxml import ElementTree
-from openpyxl import load_workbook
-from openpyxl.utils import coordinate_to_tuple, get_column_letter
+from openpyxl import __version__ as openpyxl_version, load_workbook
+from openpyxl.utils import coordinate_to_tuple, get_column_letter, range_boundaries
 from openpyxl.utils.exceptions import InvalidFileException
+
+from service.classification import OFFER, REQUIREMENTS, UNSUPPORTED
 
 MAX_PAGES = int(os.getenv("SURIQ_MAX_PAGES", "50"))
 MAX_ROWS = int(os.getenv("SURIQ_MAX_ROWS", "500"))
 MAX_COLUMNS = 64
 OCR_CONFIDENCE = int(os.getenv("SURIQ_OCR_CONFIDENCE", "75"))
 NS = "{http://www.w3.org/1999/xhtml}"
+PARSER_VERSION = "native-2.2"
 
 LINE_FIELDS = {
-    "code": "item id|bom item id|id|item no|item number|code|part no|part number|sku",
-    "material": "material|material name|item|quoted material|item name|product",
+    "code": "item id|bom item id|id|item no|item number|no|code|part no|part number|sku",
+    "material": "material|material name|item|quoted material|item name|product|material particulars|item specification|article",
     "description": "description|item description|particulars|materials description",
-    "quantity": "quantity|qty|q'ty",
-    "unit": "unit|uom|unit of measure",
+    "quantity": "quantity|qty|q'ty|required quantity|required qty|qty required|order quantity|offered quantity|volume",
+    "unit": "unit|uom|u/m|unit of measure|measure",
     "specification": "specification|specifications|spec|technical specifications",
     "dimension": "size|dimension|dimensions|diameter|thickness",
     "grade": "grade|material grade",
@@ -30,19 +33,19 @@ LINE_FIELDS = {
     "brand": "brand|manufacturer|required brand|mandatory brand",
     "preferred_brand": "preferred brand",
     "pack": "pack|pack size|packaging|packaging size",
-    "unit_price": "unit price|unit cost|price|rate|estimated unit cost|unit price php",
-    "amount": "line total|total price|amount|total|line amount|amount php",
+    "unit_price": "unit price|unit cost|price|rate|estimated unit cost|estimated unit price|unit price php|price per unit",
+    "amount": "line total|total price|amount|total|line amount|amount php|extended|extended amount|extension",
     "delivery_date": "delivery date|needed by|required delivery date",
     "lead_time": "lead time|delivery lead time",
 }
 
 TERM_FIELDS = {
-    "supplier": "supplier|supplier name|vendor",
+    "supplier": "supplier|supplier name|vendor|quoted by",
     "reference": "reference|quotation no|quote no|quotation number|quote reference",
     "quote_date": "date|quote date|quotation date",
-    "validity": "validity|valid for|valid until|expiry|expiration|validity period",
+    "validity": "validity|valid for|valid until|expiry|expiration|validity period|offer valid until|offer validity|price validity",
     "currency": "currency",
-    "delivery": "delivery|lead time|delivery lead time|delivery date|needed by|required delivery date",
+    "delivery": "delivery|indicative material delivery|material delivery|lead time|delivery lead time|delivery date|needed by|required delivery date",
     "payment": "payment|payment terms|terms of payment",
     "freight": "freight|shipping|delivery fee|delivery charge|transport|transport fee",
     "charges": "charges|additional charges|extra charges|other charges",
@@ -50,7 +53,14 @@ TERM_FIELDS = {
     "tax": "tax|tax basis|vat status|vat basis|vat treatment",
     "vat": "vat|vat amount|12% vat|vat 12%",
     "subtotal": "subtotal|sub total",
-    "total": "grand total|total payable|total amount due|total",
+    "total": "grand total|total payable|total amount due|total|total quotation|quotation total",
+    "materials_total": "materials|materials total|total materials|material cost|supplier stated materials total",
+    "item_extensions_total": "sum of item extensions|item extensions total",
+    "labor_equipment": "labor, equipment, tools|labor and equipment|labor and tools",
+    "mobilization": "mobilization and consumables|mobilization",
+    "advance_payment": "advance payment|down payment",
+    "balance_payment": "balance upon completion|balance payment",
+    "draft_notice": "draft notice",
 }
 
 ATTRIBUTES = {
@@ -61,15 +71,18 @@ ATTRIBUTES = {
 }
 UNIT_PATTERN = (
     r"pcs?|pieces?|bags?|sacks?|lengths?|sets?|rolls?|pail[s]?|packs?|kg|g|MT|tonnes?|"
-    r"mm|cm|m|sqm|sq\.?\s*m|m²|m2|cu\.?\s*m|m³|m3|l|liters?"
+    r"units?|ft|feet|mm|cm|m|sqm|sq\.?\s*m|m²|m2|cu\.?\s*m|m³|m3|l|liters?"
 )
-NUMBER_PATTERN = r"[\d,]+(?:\.\d+)?"
-FALLBACK_LINE = re.compile(
-    rf"^(?:(?P<code>[A-Z]+[-.]\d+)\s+)?(?P<material>.+?)\s+"
-    rf"(?P<quantity>{NUMBER_PATTERN})\s+(?P<unit>{UNIT_PATTERN})"
-    rf"(?:\s+(?:PHP\s*|₱)?(?P<unit_price>{NUMBER_PATTERN})\s+"
-    rf"(?:PHP\s*|₱)?(?P<amount>{NUMBER_PATTERN}))?$", re.I,
+NUMBER_PATTERN = r"(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]+)?"
+PRICE_PATTERN = rf"(?:(?:Php|₱)\s*)?{NUMBER_PATTERN}"
+MATERIAL_ROW = (
+    rf"(?P<material>.+?)\s+(?P<quantity>{NUMBER_PATTERN})\s+(?P<unit>{UNIT_PATTERN})"
+    rf"(?:\s+(?P<unit_price>{PRICE_PATTERN})\s+(?P<amount>{PRICE_PATTERN}))?"
 )
+FALLBACK_LINE = re.compile(rf"^(?:(?P<code>[A-Z]+[-.]\d+)\s+)?{MATERIAL_ROW}$", re.I)
+NUMBERED_LINE = re.compile(rf"^(?P<code>\d+|[A-Z]+[-.]\d+)\s+{MATERIAL_ROW}$", re.I)
+PDF_MONEY_FIELDS = {"subtotal", "total", "vat", "freight", "discount", "materials_total",
+                    "item_extensions_total", "labor_equipment", "mobilization", "advance_payment", "balance_payment"}
 
 
 class ExtractionError(ValueError):
@@ -104,27 +117,34 @@ def validate_file(name, content):
     suffix = Path(name).suffix.lower()
     if suffix == ".pdf" and re.match(rb"%PDF-\d\.\d", content):
         return "pdf"
-    if suffix == ".xlsx" and content.startswith(b"PK\x03\x04"):
+    if suffix in {".xlsx", ".docx"} and content.startswith(b"PK\x03\x04"):
         from io import BytesIO
         try:
             with ZipFile(BytesIO(content)) as archive:
                 entries = archive.infolist()
                 names = {entry.filename for entry in entries}
                 if (len(entries) > 2500 or sum(entry.file_size for entry in entries) > 40_000_000
-                        or any(entry.flag_bits & 1 for entry in entries)):
-                    raise ExtractionError("Workbook exceeds the safe expanded size or is encrypted.")
-                if {"[Content_Types].xml", "xl/workbook.xml"} <= names and not any(
-                    "vbaProject" in name for name in names
+                        or len(names) != len(entries) or any(
+                            entry.flag_bits & 1 or entry.filename.startswith(("/", "\\"))
+                            or ".." in entry.filename.replace("\\", "/").split("/")
+                            for entry in entries)):
+                    raise ExtractionError("The Office file exceeds safe archive limits or is encrypted.")
+                if {"[Content_Types].xml", "word/document.xml"} <= names and suffix == ".docx" and not any(
+                    "vbaproject" in name.lower() for name in names
+                ):
+                    return "docx"
+                if suffix == ".xlsx" and {"[Content_Types].xml", "xl/workbook.xml"} <= names and not any(
+                    "vbaproject" in name.lower() for name in names
                 ):
                     return "xlsx"
         except BadZipFile:
             pass
-    raise ExtractionError("Upload a valid PDF or an unencrypted XLSX workbook.")
+    raise ExtractionError("Upload a valid PDF, XLSX workbook, or DOCX document.")
 
 
-def render_page(path, page, directory, *, scan=False):
+def render_page(path, page, directory, *, scan=False, scale=None):
     target = str(Path(directory) / ("scan" if scan else "page"))
-    scale = "2400" if scan else "1800"
+    scale = str(scale or (2400 if scan else 1800))
     run_command(["pdftoppm", "-f", str(page), "-l", str(page), "-cropbox", "-png",
                  "-singlefile", "-scale-to", scale, str(path), target])
     result = Path(target + ".png")
@@ -258,36 +278,71 @@ def column_headers(words):
     return []
 
 
-def pdf_rows(snapshot, source, words, inherited):
+def keep_heading(snapshot, anchor, near_start):
+    if near_start or any(pattern.search(anchor["text"]) for pattern in (REQUIREMENTS, OFFER, UNSUPPORTED)):
+        snapshot["headings"].append(anchor)
+
+
+def pdf_term(raw):
+    if re.fullmatch(r"(?:reconstructed|draft)\s*[/–-]\s*not issued", raw, re.I):
+        return "draft_notice", raw, (0, len(raw))
+    if re.match(r"^VAT treatment was not (?:separately )?specified\b", raw, re.I):
+        return "tax", raw, (0, len(raw))
+    money = re.fullmatch(rf"(?P<label>.+?)\s+(?P<value>{PRICE_PATTERN})", raw, re.I)
+    if money:
+        name = re.sub(r"\s+\([^()]*\)$", "", money["label"].rstrip(":"))
+        name = label(name.replace("-", " "))
+        field = TERM_ALIASES.get(name)
+        if re.fullmatch(r"sum of \d+ item extensions", name):
+            field = "item_extensions_total"
+        if field in PDF_MONEY_FIELDS:
+            return field, money["value"], money.span("value")
+    term = re.match(r"^([^:]{1,45}):\s*(.+)$", raw)
+    if term and (field := TERM_ALIASES.get(label(term[1]))):
+        value = term[2]
+        if field == "vat" and re.search(r"inclus|exclus|non[ -]?vat", value, re.I):
+            field = "tax"
+        if field == "currency":
+            value = value.split("|", 1)[0].strip()
+        return field, value, (term.start(2), term.start(2) + len(value))
+    return None
+
+
+def pdf_rows(snapshot, source, rows, inherited):
     columns = inherited
-    for index, row in enumerate(row_groups(words), 1):
+    previous = None
+    for index, row in enumerate(rows, 1):
         raw = " ".join(word[0] for word in row)
         if len(raw) > 4000:
             continue
+        keep_heading(snapshot, word_anchor(source, row), index <= 8)
         header = column_headers(row)
         if header:
+            previous = None
             columns = header
             continue
-        term = re.match(r"^([^:]{1,45}):\s*(.+)$", raw)
-        if term and (field := TERM_ALIASES.get(label(term[1]))):
-            if field == "vat" and re.search(r"inclus|exclus|non[ -]?vat", term[2], re.I):
-                field = "tax"
-            add_term(snapshot, (field, term[2], word_anchor(source, words_in_span(row, *term.span(2)))))
+        term = pdf_term(raw)
+        if term:
+            field, value, span = term
+            add_term(snapshot, (field, value, word_anchor(source, words_in_span(row, *span))))
             continue
         table_term = term_from_cells([(raw, None)], lambda _: word_anchor(source, row))
         if table_term:
             add_term(snapshot, table_term)
             continue
 
-        matched_term = False
-        for alias in sorted(TERM_ALIASES, key=len, reverse=True):
-            match = re.fullmatch(rf"{re.escape(alias)}\s+[₱ ]*({NUMBER_PATTERN})", raw, re.I)
-            if match and TERM_ALIASES[alias] in {"subtotal", "total", "vat", "freight", "discount"}:
-                add_term(snapshot, (TERM_ALIASES[alias], match[1],
-                                    word_anchor(source, words_in_span(row, *match.span(1)))))
-                matched_term = True
-                break
-        if matched_term:
+        # Centered headers and right-aligned values do not share left edges.
+        # Use the literal column sequence when all six fields have that order.
+        order = [field for _, field in columns]
+        if (len(order) == 6 and order[0] == "code" and order[1] in {"material", "description"}
+                and order[2:] == ["quantity", "unit", "unit_price", "amount"]
+                and (numbered := NUMBERED_LINE.fullmatch(raw))):
+            fields = {key: value for key, value in numbered.groupdict().items() if value}
+            groups = {key: words_in_span(row, *numbered.span(key)) for key in fields}
+            anchors = {key: word_anchor(source, words) for key, words in groups.items()}
+            line = make_line(source, index, fields, anchors, groups)
+            snapshot["lines"].append(line)
+            previous = (index, line, groups)
             continue
 
         fields, groups = {}, {}
@@ -300,19 +355,43 @@ def pdf_rows(snapshot, source, words, inherited):
             fields = {key: " ".join(word[0] for word in value) for key, value in groups.items()}
         # A row without an identity and a populated numeric/unit cell is not an inferred material.
         if not (fields.keys() & {"material", "description"} and
-                any(re.fullmatch(NUMBER_PATTERN, fields.get(k, "")) for k in ("quantity", "amount", "unit_price"))):
+                ((fields.get("unit") and re.fullmatch(NUMBER_PATTERN, fields.get("quantity", "")))
+                 or any(re.fullmatch(PRICE_PATTERN, fields.get(k, ""), re.I) for k in ("amount", "unit_price")))):
             match = FALLBACK_LINE.fullmatch(raw)
             if not match:
+                if previous and index == previous[0] + 1 and len(groups) == 1:
+                    field = next(iter(groups))
+                    prior_words = previous[2].get(field)
+                    if (field in {"material", "description"} and prior_words
+                            and row[0][1][1] - prior_words[0][1][1] <= .024
+                            and re.match(r"^(?:[0-9]|grade\b|gr\.|ASTM\b|PNS\b|ISO\b)", raw, re.I)):
+                        prior_words.extend(row)
+                        fields = previous[1]["fields"]
+                        anchors = previous[1]["anchors"]
+                        fields[field] = " ".join(word[0] for word in prior_words)
+                        anchors[field] = word_anchor(source, prior_words)
+                        derive_attributes(fields, anchors, previous[2])
+                        previous[1]["original"] = " | ".join(dict.fromkeys(a["text"] for a in anchors.values()))
                 continue
             fields = {key: value for key, value in match.groupdict().items() if value}
             groups = {key: words_in_span(row, *match.span(key)) for key in fields}
         anchors = {key: word_anchor(source, words) for key, words in groups.items()}
         if line := make_line(source, index, fields, anchors, groups):
             snapshot["lines"].append(line)
+            previous = (index, line, groups)
     return columns
 
 
-def extract_pdf(path, snapshot, directory):
+def command_version(executable, flag):
+    try:
+        result = subprocess.run([executable, flag], capture_output=True, timeout=3, check=False)
+        return (result.stdout or result.stderr).decode("utf-8", "replace").splitlines()[0][:120]
+    except (OSError, subprocess.TimeoutExpired, IndexError):
+        return "unavailable"
+
+
+def extract_pdf(path, snapshot, directory, pdf_words):
+    snapshot["provenance"]["poppler"] = command_version("pdftotext", "-v")
     metadata = run_command(["pdfinfo", str(path)]).decode("utf-8", "replace")
     pages = re.search(r"^Pages:\s*(\d+)", metadata, re.M)
     if not pages or not 1 <= int(pages[1]) <= MAX_PAGES:
@@ -339,6 +418,8 @@ def extract_pdf(path, snapshot, directory):
         source = {"ref": page, "width": w, "height": h, "method": "text", "warning": ""}
         if not words:
             source["method"] = "ocr"
+            if "ocr" not in snapshot["provenance"]:
+                snapshot["provenance"]["ocr"] = command_version(os.getenv("SURIQ_TESSERACT", "tesseract"), "--version")
             try:
                 words = ocr_words(path, page, directory)
             except ExtractionError as exc:
@@ -348,7 +429,8 @@ def extract_pdf(path, snapshot, directory):
         elif any(word[2] < OCR_CONFIDENCE for word in words):
             source["warning"] = "Low-confidence OCR. Check the extracted values against this page."
         snapshot["sources"].append(source)
-        columns = pdf_rows(snapshot, page, words, columns)
+        pdf_words[page] = row_groups(words)
+        columns = pdf_rows(snapshot, page, pdf_words[page], columns)
     if len(snapshot["sources"]) != int(pages[1]):
         raise ExtractionError("Could not index every PDF page.")
 
@@ -356,6 +438,7 @@ def extract_pdf(path, snapshot, directory):
 def validate_workbook_grid(path):
     # Inspect actual cell coordinates. XLSX dimension declarations can be stale
     # and bounded iter_rows alone would silently omit distant populated cells.
+    merges = {}
     with ZipFile(path) as archive:
         for name in archive.namelist():
             if not name.startswith("xl/worksheets/") or not name.endswith(".xml"):
@@ -366,11 +449,19 @@ def validate_workbook_grid(path):
                         row, col = coordinate_to_tuple(node.get("r"))
                         if row > MAX_ROWS or col > MAX_COLUMNS:
                             raise ExtractionError(f"Workbook exceeds {MAX_ROWS} rows or {MAX_COLUMNS} columns.")
+                    if node.tag.endswith("}mergeCell"):
+                        span = node.get("ref")
+                        col1, row1, col2, row2 = range_boundaries(span)
+                        if min(col1, row1) < 1 or row2 > MAX_ROWS or col2 > MAX_COLUMNS:
+                            raise ExtractionError("A merged worksheet range exceeds the supported grid.")
+                        merges.setdefault(name, []).append((col1, row1, col2, row2))
                     node.clear()
+    return merges
 
 
 def extract_workbook(path, snapshot):
-    validate_workbook_grid(path)
+    merges = validate_workbook_grid(path)
+    snapshot["provenance"]["openpyxl"] = openpyxl_version
     workbook = load_workbook(path, data_only=False, read_only=True, keep_links=False)
     cached = None
     try:
@@ -385,6 +476,8 @@ def extract_workbook(path, snapshot):
             columns = {}
             grid = []
             warning = ""
+            prior = {}
+            ranges = merges.get(sheet._worksheet_path, [])
             for row_no, (raw_row, data_row) in enumerate(zip(
                 sheet.iter_rows(max_row=MAX_ROWS, max_col=MAX_COLUMNS),
                 cached[source].iter_rows(max_row=MAX_ROWS, max_col=MAX_COLUMNS),
@@ -407,8 +500,23 @@ def extract_workbook(path, snapshot):
                     return {"source": source, "cells": [f"{col}{row_no}" for _, col in items],
                             "text": " | ".join(raw[col] for _, col in items), "weak": False}
 
-                header = {col: LINE_ALIASES[label(value)] for col, value in values.items()
+                keep_heading(snapshot, anchor([(value, col) for col, value in values.items()]),
+                             row_no <= 8)
+                headings = dict(values)
+                if not columns and prior:
+                    for col1, row1, col2, row2 in ranges:
+                        origin = get_column_letter(col1)
+                        if row1 == row_no - 1 and row2 == row1 and origin in prior:
+                            for column in range(col1, col2 + 1):
+                                col = get_column_letter(column)
+                                combined = label(f"{prior[origin]} {values.get(col, '')}")
+                                if combined in LINE_ALIASES:
+                                    headings[col] = combined
+                        if row1 == row_no - 1 and row2 >= row_no and origin in prior:
+                            headings.setdefault(origin, prior[origin])
+                header = {col: LINE_ALIASES[label(value)] for col, value in headings.items()
                           if label(value) in LINE_ALIASES}
+                prior = values
                 if set(header.values()) & {"material", "description"} and set(header.values()) & {
                     "quantity", "unit", "unit_price"
                 }:
@@ -423,25 +531,146 @@ def extract_workbook(path, snapshot):
                            if col in values}
                 if line := make_line(source, row_no, fields, anchors):
                     snapshot["lines"].append(line)
-            snapshot["sources"].append({"ref": source, "method": "cells", "warning": warning, "rows": grid})
+            snapshot["sources"].append({"ref": source, "method": "cells", "warning": warning, "rows": grid,
+                                        "merged_ranges": ranges})
     finally:
         workbook.close()
         if cached is not None:
             cached.close()
 
 
-def extract(content, kind):
-    snapshot = {"sources": [], "lines": [], "terms": {}, "term_anchors": {}, "term_mentions": {}}
+def extract_docx(path, snapshot):
+    ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    with ZipFile(path) as archive:
+        body = ElementTree.fromstring(archive.read("word/document.xml")).find(ns + "body")
+    if body is None:
+        raise ExtractionError("DOCX document body is missing.")
+
+    def text(node):
+        return " ".join("".join(run.text or "" for run in para.iter(ns + "t"))
+                        for para in node.iter(ns + "p")).strip()
+
+    def add_section(source, rows, paragraph=False):
+        grid = []
+        columns = {}
+        for index, row in enumerate(rows, 1):
+            values = {get_column_letter(col): value for col, value in enumerate(row, 1) if value}
+            if not values:
+                continue
+            if len(values) > MAX_COLUMNS or index > MAX_ROWS:
+                raise ExtractionError("DOCX source exceeds the supported table size.")
+            grid.append({"row": index, "cells": values})
+
+            def anchor(items):
+                return {"source": source, "cells": [f"{col}{index}" for _, col in items],
+                        "text": " | ".join(value for value, _ in items), "weak": False}
+
+            items = [(value, col) for col, value in values.items()]
+            keep_heading(snapshot, anchor(items), paragraph or index <= 3)
+            term = term_from_cells(items, anchor)
+            if term:
+                add_term(snapshot, term)
+                continue
+            header = {col: LINE_ALIASES[label(value)] for col, value in values.items()
+                      if label(value) in LINE_ALIASES}
+            if set(header.values()) & {"material", "description"} and set(header.values()) & {"quantity", "unit"}:
+                columns = header
+                continue
+            fields = {field: values[col] for col, field in columns.items() if col in values}
+            anchors = {field: anchor([(values[col], col)]) for col, field in columns.items() if col in values}
+            if line := make_line(source, index, fields, anchors):
+                snapshot["lines"].append(line)
+        if grid:
+            snapshot["sources"].append({"ref": source, "method": "cells", "warning": "", "rows": grid})
+
+    paragraphs = tables = 0
+    for element in body:
+        if element.tag == ns + "p":
+            paragraphs += 1
+            add_section(f"Paragraph {paragraphs}", [[text(element)]], paragraph=True)
+        elif element.tag == ns + "tbl":
+            tables += 1
+            add_section(f"Table {tables}", [[text(cell) for cell in row.findall(ns + "tc")]
+                                           for row in element.findall(ns + "tr")])
+
+
+def extract(content, kind, *, on_inference=lambda: None, use_gemini=False):
+    from service.adaptive import assist
+    from service.classification import classify
+
+    snapshot = {"headings": [], "sources": [], "lines": [], "terms": {}, "term_anchors": {}, "term_mentions": {},
+                "provenance": {"parser": PARSER_VERSION, "inference": "not_required"}}
+    pdf_words = {}
     with TemporaryDirectory(prefix="suriq-") as directory:
         path = Path(directory) / f"source.{kind}"
         path.write_bytes(content)
         try:
             if kind == "pdf":
-                extract_pdf(path, snapshot, directory)
-            else:
+                extract_pdf(path, snapshot, directory, pdf_words)
+            elif kind == "xlsx":
                 extract_workbook(path, snapshot)
+            else:
+                extract_docx(path, snapshot)
         except ExtractionError:
             raise
         except (BadZipFile, InvalidFileException, ElementTree.ParseError, OSError, KeyError, ValueError) as exc:
             raise ExtractionError("The source could not be decoded. Check the file and retry.") from exc
+        classification = classify(snapshot)
+        assist(snapshot, path, directory, pdf_words, classification, on_inference, use_gemini)
+        snapshot["classification"] = classify(snapshot)
+    snapshot.pop("headings")
     return snapshot
+
+
+def validate_docx_rendering(content):
+    from io import BytesIO
+
+    with ZipFile(BytesIO(content)) as archive:
+        for name in archive.namelist():
+            lower = name.lower()
+            if ("embeddings/" in lower or "vbaproject" in lower or "activex/" in lower
+                    or lower.endswith((".svg", ".svgz", ".css", ".html", ".htm", ".mhtml"))):
+                raise ExtractionError("DOCX rendering is unavailable for embedded active content.")
+            if lower.endswith(".rels"):
+                relationships = ElementTree.fromstring(archive.read(name))
+                if any(rel.get("TargetMode", "").casefold() == "external" for rel in relationships):
+                    raise ExtractionError("DOCX rendering is unavailable for files with external references.")
+            if lower.startswith("word/") and lower.endswith(".xml"):
+                xml = ElementTree.fromstring(archive.read(name))
+                for item in xml.iter():
+                    tag = item.tag.rsplit("}", 1)[-1]
+                    if tag in {"altChunk", "object", "control", "attachedTemplate", "updateFields", "subDoc", "imagedata"}:
+                        raise ExtractionError("DOCX rendering is unavailable for linked or active content.")
+                    if tag in {"instrText", "fldSimple"}:
+                        instruction = item.text or next(iter(item.attrib.values()), "")
+                        if not re.match(r"\s*(?:PAGE|NUMPAGES|SECTION|SECTIONPAGES|DATE|TIME)\b", instruction, re.I):
+                            raise ExtractionError("DOCX rendering is unavailable for unsupported Word fields.")
+
+
+def render_docx(content):
+    """Render a self-contained Word document with an isolated LibreOffice profile."""
+    try:
+        validate_docx_rendering(content)
+    except ExtractionError:
+        raise
+    except (BadZipFile, ValueError, ElementTree.ParseError) as exc:
+        raise ExtractionError("The DOCX contains invalid rendering data.") from exc
+    with TemporaryDirectory(prefix="suriq-docx-render-") as directory:
+        root = Path(directory)
+        path = root / "source.docx"
+        path.write_bytes(content)
+        user = root / "profile" / "user"
+        user.mkdir(parents=True)
+        (user / "registrymodifications.xcu").write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<oor:items xmlns:oor="http://openoffice.org/2001/registry">'
+            '<item oor:path="/org.openoffice.Office.Common/Security/Scripting">'
+            '<prop oor:name="DisableMacrosExecution" oor:op="fuse"><value>true</value></prop>'
+            '</item></oor:items>'
+        )
+        run_command([os.getenv("SURIQ_SOFFICE", "soffice"), f"-env:UserInstallation={(root / 'profile').as_uri()}",
+                     "--headless", "--norestore", "--convert-to", "pdf:writer_pdf_Export", "--outdir", directory, str(path)])
+        result = root / "source.pdf"
+        if not result.is_file() or result.stat().st_size > 40_000_000:
+            raise ExtractionError("The DOCX paginated preview could not be created within the render limit.")
+        return result.read_bytes()

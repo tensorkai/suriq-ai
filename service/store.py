@@ -1,5 +1,6 @@
 """SQLite transaction boundaries and views over immutable source data."""
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -21,7 +22,7 @@ CREATE TABLE IF NOT EXISTS documents (
     status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', snapshot_id INTEGER,
     UNIQUE(batch, digest)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS one_bom ON documents(batch) WHERE role = 'bom';
+DROP INDEX IF EXISTS one_bom;
 CREATE TABLE IF NOT EXISTS snapshots (
     id INTEGER PRIMARY KEY, document TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     created TEXT NOT NULL, content TEXT NOT NULL
@@ -58,6 +59,14 @@ class Store:
         with self.connection(initialize=True) as db:
             db.execute("PRAGMA journal_mode = WAL")
             db.executescript(SCHEMA)
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(documents)")}
+            for column, declaration in {
+                "intake": "TEXT NOT NULL DEFAULT 'legacy'",
+                "revises": "TEXT REFERENCES documents(id) ON DELETE SET NULL",
+                "processing_step": "TEXT NOT NULL DEFAULT ''",
+            }.items():
+                if column not in columns:
+                    db.execute(f"ALTER TABLE documents ADD COLUMN {column} {declaration}")
 
     @contextmanager
     def connection(self, write=False, initialize=False):
@@ -84,11 +93,22 @@ def event(db, batch, action, data):
                (batch, action, now(), json.dumps(data, ensure_ascii=False)))
 
 
+def apply_fields(values, anchors, changes):
+    anchors.update(changes.get("anchors", {}))
+    for field, value in changes.get("values", {}).items():
+        anchor = anchors.get(field)
+        if anchor and value != values.get(field):
+            numeric = field in {"quantity", "unit_price", "amount", "subtotal", "total", "freight", "vat", "discount"}
+            left = r"(?<!\w)(?<!\d[.,])" if numeric else r"(?<!\w)"
+            right = r"(?!\w|[.,]\d)" if numeric else r"(?!\w)"
+            if not value or not re.search(left + re.escape(value) + right, anchor["text"], re.I):
+                anchors[field] = {**anchor, "weak": True}
+        values[field] = value
+
+
 def apply_overlay(document, target, changes):
     if target == "@terms":
-        for field, value in changes.get("values", {}).items():
-            document["terms"][field] = value
-        document["term_anchors"].update(changes.get("anchors", {}))
+        apply_fields(document["terms"], document["term_anchors"], changes)
         document["corrected_terms"] = list(changes.get("values", {}))
         return
     line = next((line for line in document["lines"] if line["id"] == target), None)
@@ -96,15 +116,15 @@ def apply_overlay(document, target, changes):
         line = {"id": target, "fields": {}, "anchors": {}, "original": ""}
         document["lines"].append(line)
     if line is not None:
-        line["fields"].update(changes.get("values", {}))
-        line["anchors"].update(changes.get("anchors", {}))
-        line.update({key: changes[key] for key in ("match", "factor") if key in changes})
+        apply_fields(line["fields"], line["anchors"], changes)
+        line.update({key: changes[key] for key in ("match", "factor", "excluded") if key in changes})
 
 
 def documents(db, batch):
     rows = db.execute("""
         SELECT d.id, d.batch, d.role, d.name, d.kind, d.supplier, d.coverage, d.digest,
-               d.status, d.error, s.content, s.created AS extracted_at
+               d.status, d.error, d.intake, d.revises, d.processing_step,
+               d.snapshot_id, s.content, s.created AS extracted_at
         FROM documents d LEFT JOIN snapshots s ON s.id = d.snapshot_id
         WHERE d.batch = ? ORDER BY d.role, d.rowid
     """, (batch,))
@@ -117,7 +137,16 @@ def documents(db, batch):
         })
         for overlay in db.execute("SELECT target, changes FROM overlays WHERE document = ?", (doc["id"],)):
             apply_overlay(doc, overlay["target"], json.loads(overlay["changes"]))
+        if doc["role"] == "quote" and doc["intake"] == "auto" and doc["terms"].get("supplier"):
+            doc["supplier"] = doc["terms"]["supplier"]
         docs.append(doc)
+    from service.verification import summary_quote
+
+    superseded = {doc["revises"]: doc["id"] for doc in docs if doc["revises"] and doc["role"] == "quote"
+                  and doc["status"] in {"ready", "needs_review"}
+                  and (any(not line.get("excluded") for line in doc["lines"]) or summary_quote(doc))}
+    for doc in docs:
+        doc["superseded_by"] = superseded.get(doc["id"])
     return docs
 
 

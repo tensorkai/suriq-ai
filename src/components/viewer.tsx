@@ -67,7 +67,7 @@ export function SourceViewer({ doc, initial, anchors = [], zoom = 100, onLink, d
 
   return <article className="source-card">
     <header className="source-header">
-      <span className={`role-tag ${doc.role}`}>{doc.role === "bom" ? "BOM" : "QUOTE"}</span>
+      <span className={`role-tag ${doc.role}`}>{doc.role === "bom" ? "BOM" : doc.role === "quote" ? "QUOTE" : "REVIEW"}</span>
       <div className="source-title"><strong>{docName(doc)}</strong><small title={doc.name}>{doc.name}</small></div>
       <a className="icon-button" href={`${path}/original`} aria-label={`Download ${doc.name}`}><Download size={15} /></a>
     </header>
@@ -81,8 +81,11 @@ export function SourceViewer({ doc, initial, anchors = [], zoom = 100, onLink, d
       </select>
       <button className="icon-button" type="button" aria-label="Next source" disabled={index === doc.sources.length - 1}
         onClick={() => select(doc.sources[index + 1].ref)}><ChevronRight size={16} /></button>
-      <span className="source-method">{source.method === "cells" ? "WORKSHEET" : source.method === "ocr" ? "OCR" : "PDF TEXT"}</span>
+      <span className="source-method">{doc.kind === "docx" ? "DOCX STRUCTURE" : source.method === "cells" ? "WORKSHEET" : source.method === "ocr" ? "OCR" : "PDF TEXT"}</span>
     </div>
+    {doc.kind === "docx" && <p className="source-warning">Structured source reference. Precise page highlighting is unavailable.
+      {" "}<a href={`${path}/rendered`} target="_blank" rel="noreferrer">Open paginated preview</a>
+    </p>}
     {source.warning && <p className="source-warning"><FileWarning size={15} /> {source.warning}</p>}
     {doc.kind === "pdf" ? <div className="paper-scroll" ref={pane}>
       {imageError === source.ref ? <p className="empty small">Page rendering failed. Download the original to inspect it.</p> :
@@ -129,7 +132,9 @@ export function SourceViewer({ doc, initial, anchors = [], zoom = 100, onLink, d
     </div>}
     {scoped.length > 0 && <ul className="evidence-text" aria-label="Highlighted evidence">
       {scoped.map((anchor, idx) => <li key={idx}><LocateFixed size={14} />
-        <span>{anchor.cells?.length ? `${anchor.cells.join(", ")} · ` : ""}{anchor.text || "Source needs review"}</span>
+        <span>{anchor.cells?.length ? `${anchor.cells.join(", ")} · ` : ""}{anchor.text || "Source needs review"}
+          {!anchor.cells?.length && !anchor.boxes?.length ? " · Precise anchor unavailable" : anchor.weak ? " · Needs review" : ""}
+        </span>
       </li>)}
     </ul>}
   </article>;

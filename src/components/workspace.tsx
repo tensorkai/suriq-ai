@@ -20,7 +20,7 @@ const views = [
 ] as const;
 type View = typeof views[number]["id"];
 type Dialog = { kind: "project" } | { kind: "batch"; project: Project } |
-  { kind: "upload" } | { kind: "manageProject"; project: Project } | { kind: "manageBatch" } |
+  { kind: "upload"; revises?: Document } | { kind: "manageProject"; project: Project } | { kind: "manageBatch" } |
   { kind: "manageFile"; doc: Document };
 
 export function Workspace() {
@@ -109,9 +109,8 @@ export function Workspace() {
 
   const blocked = active?.issues.filter((issue) => issue.severity === "Blocking").length ?? 0;
   const warnings = active?.issues.filter((issue) => issue.severity === "Warning").length ?? 0;
-  const quotes = active?.documents.filter((doc) => doc.role === "quote").length ?? 0;
-  const canVerify = active?.documents.some((doc) => doc.role === "bom") && quotes > 0 &&
-    active.documents.every((doc) => doc.status === "ready" || doc.status === "needs_review");
+  const quotes = active?.documents.filter((doc) => doc.role === "quote" && !doc.superseded_by).length ?? 0;
+  const canVerify = Boolean(active && !active.verification_problem);
   const verified = Boolean(active?.verified_at && !active.stale);
 
   return <div className="app-shell">
@@ -140,7 +139,7 @@ export function Workspace() {
               <Plus size={15} /> New batch</button>
           </div>}
         </div>)}
-        <div className="sidebar-foot"><ShieldCheck size={17} /><span><strong>On-device processing</strong><small>Local files and verification</small></span></div>
+        <div className="sidebar-foot"><ShieldCheck size={17} /><span><strong>{active?.ai.provider === "gemini" ? "Gemini AI available by opt-in" : "On-device processing"}</strong><small>Local files and verification</small></span></div>
       </aside>
       <main className="main-content">
         {error && <div className="banner error" role="alert">{error}<button type="button" onClick={() => setError("")}>Dismiss</button></div>}
@@ -155,7 +154,7 @@ export function Workspace() {
                   <button className="icon-button batch-menu" type="button" aria-label="Manage batch"
                     onClick={() => setDialog({ kind: "manageBatch" })}><Ellipsis size={20} /></button>
                   <button className="button secondary" type="button" onClick={() => setDialog({ kind: "upload" })}
-                    disabled={active.documents.length >= 6}><UploadCloud size={16} /> Upload</button>
+                    disabled={working}><UploadCloud size={16} /> Upload</button>
                   <button className="button primary" type="button" disabled={!canVerify || working} onClick={async () => {
                     setWorking(true); setError("");
                     try { accept(await api<Batch>(`/batches/${active.id}/verify`, "POST")); setView("findings"); }
@@ -164,6 +163,10 @@ export function Workspace() {
                   }}><ScanLine size={17} /> {working ? "Verifying…" : "Run verification"}</button>
                 </div>
               </div>
+              {active.ai.provider === "gemini" && !active.ai.configured &&
+                <p className="notice" role="status">Add a Gemini API key to enable hosted AI. Native extraction is available.</p>}
+              {active.documents.length > 0 && active.verification_problem &&
+                <p className="notice" role="status">{active.verification_problem}</p>}
               <div className="batch-stats">
                 <div><span>Source files</span><strong>{active.documents.length}</strong><small>{quotes} supplier {quotes === 1 ? "offer" : "offers"}</small></div>
                 <div><span>Findings</span><strong>{verified ? active.issues.length : "—"}</strong><small>{verified ? `${blocked} blocking · ${warnings} warnings` : "Awaiting verification"}</small></div>
@@ -182,7 +185,7 @@ export function Workspace() {
                   <div><a href={`/api/batches/${active.id}/export/pdf`}>Download PDF</a><a href={`/api/batches/${active.id}/export/csv`}>Download CSV</a></div></details>}
               </div>
               {view === "documents" && <Documents key={active.id} batch={active} update={accept}
-                upload={() => setDialog({ kind: "upload" })} manage={(doc) => setDialog({ kind: "manageFile", doc })} />}
+                upload={() => setDialog({ kind: "upload" })} revise={(doc) => setDialog({ kind: "upload", revises: doc })} manage={(doc) => setDialog({ kind: "manageFile", doc })} />}
               {view === "findings" && <Findings key={active.id} batch={active} update={accept} />}
               {view === "comparison" && <SupplierComparison batch={active} />}
               {view === "activity" && <Activity batch={active} />}
@@ -194,7 +197,7 @@ export function Workspace() {
       close={() => setDialog(null)} save={(name) => create("project", name)} />}
     {dialog?.kind === "batch" && <NameDialog title="New procurement batch" label="Batch name" submit="Create batch"
       close={() => setDialog(null)} save={(name) => create("batch", name, dialog.project.id)} />}
-    {dialog?.kind === "upload" && active && <UploadDialog batch={active} close={() => setDialog(null)} update={accept} />}
+    {dialog?.kind === "upload" && active && <UploadDialog batch={active} revises={dialog.revises} close={() => setDialog(null)} update={accept} />}
     {dialog?.kind === "manageProject" && <NameDialog title="Manage project" label="Project name" submit="Save name"
       initial={dialog.project.name} close={() => setDialog(null)} save={async (name) => {
         await api(`/projects/${dialog.project.id}`, "PATCH", { name });
@@ -273,36 +276,48 @@ function NameDialog({ title, label, initial = "", submit, close, save, remove, d
   </Modal>;
 }
 
-function UploadDialog({ batch, update, close }: { batch: Batch; update: (data: Batch) => void; close: () => void }) {
-  const hasBom = batch.documents.some((doc) => doc.role === "bom");
-  const quotes = batch.documents.filter((doc) => doc.role === "quote").length;
-  const [role, setRole] = useState(hasBom ? "quote" : "bom");
+function UploadDialog({ batch, revises, update, close }: {
+  batch: Batch; revises?: Document; update: (data: Batch) => void; close: () => void;
+}) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  return <Modal title="Upload source document" close={close}>
+  const [files, setFiles] = useState<File[]>([]);
+  const [useGemini, setUseGemini] = useState(false);
+  const gemini = batch.ai.provider === "gemini";
+  return <Modal title={revises ? "Upload revised quotation" : "Add BOM and supplier quotation files"} close={close}>
     <form className="modal-body stack" onSubmit={async (event) => {
       event.preventDefault(); setBusy(true); setError("");
-      const data = new FormData(event.currentTarget);
+      const failures: string[] = [];
+      const remaining: File[] = [];
       try {
-        await api(`/batches/${batch.id}/documents`, "POST", data);
-        update(await api<Batch>(`/batches/${batch.id}`)); close();
+        for (const file of files) {
+          const data = new FormData();
+          data.append("file", file);
+          if (gemini && batch.ai.configured && useGemini) data.append("use_gemini", "true");
+          if (revises) data.append("revises", revises.id);
+          try { await api(`/batches/${batch.id}/documents`, "POST", data); }
+          catch (error) { remaining.push(file); failures.push(`${file.name}: ${(error as Error).message}`); }
+        }
+        update(await api<Batch>(`/batches/${batch.id}`));
+        if (failures.length) { setFiles(remaining); setError(failures.join(" • ")); } else close();
       } catch (error) { setError((error as Error).message); }
       finally { setBusy(false); }
     }}>
-      <p>PDF and XLSX originals stay in the local workspace.</p>
-      <label>Document role<select name="role" value={role} onChange={(event) => setRole(event.target.value)}>
-        <option value="bom" disabled={hasBom}>Bill of materials</option>
-        <option value="quote" disabled={quotes >= 5}>Supplier quotation</option>
-      </select></label>
-      {role === "quote" && <>
-        <label>Supplier name<input name="supplier" placeholder="e.g. North Steel Supply" maxLength={120} required /></label>
-        <label>Supplier coverage<select name="coverage" defaultValue="unknown">
-          <option value="unknown">Coverage unknown</option><option value="full">Full scope</option><option value="partial">Partial offer</option>
-        </select></label>
-      </>}
-      <label className="file-field"><span><UploadCloud size={19} /> Choose a PDF or XLSX</span><input type="file" name="file" accept=".pdf,.xlsx" required /></label>
+      <p>{revises ? `Revision of ${revises.name}. The original stays available in this batch.` :
+        "SuriQ identifies document types from their contents. Originals stay in the local workspace."}</p>
+      <label className="file-field" onDragOver={(event) => event.preventDefault()} onDrop={(event) => {
+        event.preventDefault();
+        if (!busy) setFiles(Array.from(event.dataTransfer.files).slice(0, revises ? 1 : undefined));
+      }}><span><UploadCloud size={19} /> Choose or drop PDF, XLSX, or DOCX files</span>
+        <input type="file" name="file" accept=".pdf,.xlsx,.docx" multiple={!revises} disabled={busy}
+          onChange={(event) => setFiles(Array.from(event.currentTarget.files ?? []))} /></label>
+      {files.length > 0 && <p className="muted">{files.map((file) => file.name).join(", ")}</p>}
+      {gemini && (batch.ai.configured ? <label className="inline">
+        <input type="checkbox" checked={useGemini} disabled={busy} onChange={(event) => setUseGemini(event.target.checked)} />
+        Allow Gemini to receive excerpts and page images from these non-confidential files
+      </label> : <p className="notice">Native extraction will run. Gemini needs an API key.</p>)}
       {error && <p className="error" role="alert">{error}</p>}
-      <button type="submit" className="button primary" disabled={busy || (hasBom && quotes >= 5)}>{busy ? "Uploading…" : "Upload and extract"}</button>
+      <button type="submit" className="button primary" disabled={busy || !files.length}>{busy ? "Uploading…" : "Upload and extract"}</button>
     </form>
   </Modal>;
 }
