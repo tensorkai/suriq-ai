@@ -10,7 +10,7 @@ from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.pdfbase.pdfmetrics import registerFont, registerFontFamily
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import CondPageBreak, LongTable, Paragraph, SimpleDocTemplate, Spacer
+from reportlab.platypus import CondPageBreak, HRFlowable, LongTable, Paragraph, SimpleDocTemplate, Spacer, Table
 
 from service.boq import is_boq, material_line
 from service.presentation import REVIEW, material_label, money_display, source_label, supplier_label
@@ -104,6 +104,20 @@ def report(batch, extension):
     return verification_pdf(batch), "application/pdf"
 
 
+# Same tones as the UI .pill classes.
+PILL_TONES = {
+    **dict.fromkeys(("blocking", "failed", "mismatch"), ("#8f302d", "#fbedeb")),
+    **dict.fromkeys(("warning", "needs review", "incomparable", "needs clarification", "coverage unknown",
+                     "check source"), ("#744810", "#fbf2db")),
+    **dict.fromkeys(("confirmed", "pass", "ready", "comparable"), ("#225639", "#e4f2e7")),
+}
+
+
+def pill(value):
+    ink, fill = PILL_TONES.get(str(value).replace("_", " ").lower(), ("#365749", "#eaf1eb"))
+    return f'<font color="{ink}" backColor="{fill}"><b>&nbsp;{report_text(str(value).replace("_", " ").capitalize())}&nbsp;</b></font>'
+
+
 def report_text(value):
     # The bundled font does not include a peso sign.
     return escape(str(value).replace("₱", "PHP ").replace("→", "to")).replace("\n", "<br/>")
@@ -128,6 +142,12 @@ def verification_pdf(batch):
     styles.add(ParagraphStyle("ReportHeader", parent=styles["ReportCell"], fontName=REPORT_BOLD,
                               textColor=green))
     styles.add(ParagraphStyle("ReportAmountHeader", parent=styles["ReportHeader"], alignment=TA_RIGHT))
+    styles.add(ParagraphStyle("ReportLabel", parent=styles["ReportCell"], fontName=REPORT_BOLD, fontSize=7.4,
+                              leading=10, textColor=muted, spaceAfter=1))
+    styles.add(ParagraphStyle("ReportValue", parent=styles["ReportCell"], fontName=REPORT_BOLD))
+    styles.add(ParagraphStyle("ReportMuted", parent=styles["ReportCell"], fontSize=7.6, leading=10.2,
+                              textColor=muted, spaceBefore=2))
+    styles.add(ParagraphStyle("ReportPills", parent=styles["ReportCell"], leading=14, spaceAfter=2, keepWithNext=True))
     styles.add(ParagraphStyle("ReportKicker", parent=styles["ReportHeader"], fontSize=9,
                               spaceAfter=5, textColor=muted, keepWithNext=True))
     docs = {doc["id"]: doc for doc in batch["documents"]}
@@ -142,20 +162,51 @@ def verification_pdf(batch):
         story.append(Paragraph(f"{prefix}{report_text(value)}", styles["ReportLine"]))
 
     def table(header, rows, fractions, amounts=()):
-        body = [[Paragraph(report_text(value), styles["ReportAmountHeader" if index in amounts else "ReportHeader"])
+        rich = any(isinstance(value, list) for row in [header, *rows] for value in row)
+        def cell(value, style):
+            return value if isinstance(value, list) else Paragraph(report_text(value or "—"), styles[style])
+        body = [[cell(value, "ReportAmountHeader" if index in amounts else "ReportHeader")
                  for index, value in enumerate(header)]]
-        body.extend([Paragraph(report_text(value or "—"), styles["ReportAmount" if index in amounts else "ReportCell"])
+        body.extend([cell(value, "ReportAmount" if index in amounts else "ReportCell")
                      for index, value in enumerate(row)] for row in rows)
         story.append(LongTable(body, colWidths=[(report.width - 12) * share for share in fractions], repeatRows=1,
-                               splitInRow=1, hAlign="LEFT", style=[
+                               splitInRow=0 if rich else 1, hAlign="LEFT", style=[
                                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
                                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e8f1eb")),
                                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7f9f6")]),
                                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
                                    ("TOPPADDING", (0, 0), (-1, -1), 6),
                                    ("LINEBELOW", (0, 0), (-1, 0), .7, rule),
-                                   ("LINEBELOW", (0, -1), (-1, -1), .5, rule),
+                                   ("LINEBELOW", (0, 1), (-1, -1), .4, rule),
                                ]))
+
+    def facts(rows):
+        """Labelled boxes like the UI's finding values; a 1-item row spans the full width."""
+        width = report.width - 12
+        body, spans = [], []
+        for index, row in enumerate(rows):
+            cells = [[Paragraph(report_text(label), styles["ReportLabel"]),
+                      Paragraph(report_text(value or "Unestablished"), styles["ReportCell"])] for label, value in row]
+            if len(cells) == 1:
+                cells.append("")
+                spans.append(("SPAN", (0, index), (1, index)))
+            body.append(cells)
+        story.append(Table(body, colWidths=[width / 2] * 2, hAlign="LEFT", style=[
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("BOX", (0, 0), (-1, -1), .6, rule),
+            ("INNERGRID", (0, 0), (-1, -1), .4, rule),
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#fbfcfa")),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            *spans,
+        ]))
+
+    def separator():
+        story.append(HRFlowable(width="100%", thickness=.6, color=rule, spaceBefore=12, spaceAfter=10))
+
+    def groups(items, size=3):
+        return [items[start:start + size] for start in range(0, len(items), size)]
 
     def sources(anchors):
         locations = defaultdict(list)
@@ -179,13 +230,14 @@ def verification_pdf(batch):
     offers = summary["offers"]
     story.append(Paragraph("SuriQ verification report", styles["ReportKicker"]))
     heading("Supplier Quotation Summary")
-    line("Internal canvass", "Purpose")
-    line(" · ".join(filter(None, (summary["project"], batch["name"], summary["site"]))), "Project and batch")
-    line(summary["scope"], "Purchase scope")
+    header = [[("Project and batch", " · ".join(filter(None, (summary["project"], batch["name"], summary["site"])))),
+               ("Purchase scope", summary["scope"])],
+              [("Purpose", "Internal canvass"), ("Verified", summary["verified"])]]
     if count := summary["exclusions"]:
-        line(f"{count} baseline {'row is' if count == 1 else 'rows are'} outside the material comparison.")
-    line(summary["verified"], "Verified")
-    story.append(Spacer(1, 8))
+        header.append([("Exclusions", f"{count} baseline {'row is' if count == 1 else 'rows are'} "
+                                      "outside the material comparison.")])
+    facts(header)
+    story.append(Spacer(1, 10))
     table(["Supplier", "Quote reference", "Quoted offer total", "Comparable payable total"], [
         [offer["supplier"], offer["cells"]["reference"]["value"], offer["cells"]["quoted_total"]["value"],
          offer["cells"]["payable"]["value"]] for offer in offers
@@ -197,22 +249,23 @@ def verification_pdf(batch):
         line("No findings in this verification.")
     for index, issue in enumerate(issues.values(), 1):
         detail = issue["detail"]
-        story.append(CondPageBreak(133))
+        story.append(CondPageBreak(160))
+        if index > 1:
+            separator()
+        story.append(Paragraph(" ".join(pill(value) for value in (
+            issue["severity"], REVIEW[issue["review"]["status"]],
+            "Check source" if issue.get("review_required") else "") if value), styles["ReportPills"]))
         heading(f"{index:02d} · {issue['title']}", 2)
         if detail["context"]:
-            line(detail["context"])
-        line(f"{issue['severity']} · {REVIEW[issue['review']['status']]}", "Review")
-        story.append(Spacer(1, 5))
-        table(["Expected or required", "Offered or observed"],
-              [[detail[key] or "Unestablished" for key in ("expected", "observed")]], [.5, .5])
-        story.append(Spacer(1, 4))
-        for key, label in (("reason", "Difference or unresolved reason"), ("action", "Action")):
-            line(detail[key] or "Unestablished", label)
+            story.append(Paragraph(report_text(detail["context"]), styles["ReportKicker"]))
+        rows = [[("Expected or required", detail["expected"]), ("Offered or observed", detail["observed"])],
+                [("Difference or unresolved reason", detail["reason"])], [("Action", detail["action"])]]
         if issue["review"]["note"]:
-            line(issue["review"]["note"], "Internal note")
+            rows.append([("Internal note", issue["review"]["note"])])
+        facts(rows)
         if issue["evidence"]:
             story.append(CondPageBreak(82))
-            heading(f"Source evidence for finding {index:02d}", 3)
+            heading(f"Source evidence · finding {index:02d}", 3)
             table(["Role", "Source and location", "Evidence excerpt"], [
                 [detail["source_labels"].get(anchor["document"], "Source"),
                  f"{docs.get(anchor['document'], {}).get('name', 'Source')} · {source_label(anchor)}",
@@ -221,7 +274,8 @@ def verification_pdf(batch):
 
     story.append(CondPageBreak(102))
     heading("Scope and sources")
-    line(summary["scope"], "Purchase scope")
+    facts([[("Purchase scope", summary["scope"])]])
+    story.append(Spacer(1, 8))
     role_labels = {"bom": "Bill of Materials", "boq": "Bill of Quantities", "quote": "Supplier quotation",
                    "buyer": "Buyer requirements", "bundle": "Quotation bundle", "reference": "Reference"}
     def page_assignments(doc):
@@ -246,17 +300,22 @@ def verification_pdf(batch):
 
     story.append(CondPageBreak(132))
     heading("Commercial terms and evidence")
-    for offer in offers:
+    def summary_cell(cell, key):
+        parts = [Paragraph(report_text(cell["value"] or "Unstated"), styles["ReportValue"])]
+        parts += [Paragraph("• " + report_text(note), styles["ReportCell"])
+                  for note in summary_notes(cell, key).split("\n") if note]
+        parts += [Paragraph(report_text(source), styles["ReportMuted"]) for source in sources(cell["evidence"])]
+        return parts
+
+    for group in groups(offers):
         story.append(CondPageBreak(96))
-        heading(offer["supplier"], 2)
-        rows = []
-        for field in summary["fields"]:
-            key = field["key"]
-            cell = offer["cells"][key]
-            rows.append([field["label"], cell["value"] or "Unstated", summary_notes(cell, key),
-                         "\n".join(sources(cell["evidence"]))])
-        table(["Comparison basis", "Verified value", "Notes and findings", "Source references"],
-              rows, [.18, .32, .31, .19])
+        share = .78 / len(group)
+        table(["Comparison basis", *[[Paragraph(report_text(offer["supplier"]), styles["ReportHeader"]),
+                                      Paragraph(pill("Comparable" if offer.get("comparable") else "Incomparable"),
+                                                styles["ReportCell"])] for offer in group]],
+              [[field["label"], *[summary_cell(offer["cells"][field["key"]], field["key"]) for offer in group]]
+               for field in summary["fields"]], [.22, *[share] * len(group)])
+        story.append(Spacer(1, 8))
 
     comparisons = {row["document"]: row for row in batch["comparison"]}
     baseline = docs.get(batch.get("baseline_document")) or next(
@@ -272,24 +331,34 @@ def verification_pdf(batch):
     if itemized:
         story.append(CondPageBreak(102))
         heading("Detailed line items")
-    for offer in itemized:
+
+    def item_cell(item, currency):
+        if not item:
+            return [Paragraph(pill("Unknown"), styles["ReportCell"])]
+        parts = [Paragraph(pill(item["state"]), styles["ReportCell"])]
+        for fields in item["offers"]:
+            parts.append(Paragraph(report_text(" · ".join(filter(None, (
+                " ".join(filter(None, (fields.get("quantity"), fields.get("unit")))) or "—",
+                money_display(fields.get("unit_price"), currency),
+                fields.get("amount") and "Line " + money_display(fields.get("amount"), currency))))),
+                styles["ReportValue"]))
+            parts.append(Paragraph(report_text(" · ".join(dict.fromkeys(filter(None, (
+                material_label(fields), fields.get("specification"), fields.get("pack"), fields.get("grade")))))),
+                styles["ReportMuted"]))
+        return parts
+
+    for group in groups(itemized):
+        rows = [comparisons[offer["document"]] for offer in group]
+        keys = list(dict.fromkeys(key for row in rows for key in row["items"]))
         story.append(CondPageBreak(82))
-        heading(offer["supplier"], 2)
-        row = comparisons[offer["document"]]
-        rows = [
-            [required.get(key) or key, item["state"],
-             "\n".join(dict.fromkeys(filter(None, (material_label(fields), fields.get("specification"),
-                                                   fields.get("pack"), fields.get("grade"))))),
-             " ".join(filter(None, (fields.get("quantity"), fields.get("unit")))),
-             money_display(fields.get("unit_price"), row["currency"]),
-             money_display(fields.get("amount"), row["currency"])]
-            for key, item in row["items"].items() for fields in item["offers"] or [{}]
-        ]
-        if rows:
-            table(["Required item", "Result", "Offered item", "Quantity", "Unit price", "Line amount"],
-                  rows, [.25, .12, .26, .10, .13, .14], amounts=(3, 4, 5))
-        else:
+        if not keys:
             line("No line item results are available.")
+            continue
+        share = .74 / len(group)
+        table(["Required material", *[offer["supplier"] for offer in group]],
+              [[required.get(key) or key, *[item_cell(row["items"].get(key), row["currency"]) for row in rows]]
+               for key in keys], [.26, *[share] * len(group)])
+        story.append(Spacer(1, 8))
 
     corrections = [row for row in report_rows(batch) if row[0] in {"Conversion", "Correction"}]
     if corrections:
