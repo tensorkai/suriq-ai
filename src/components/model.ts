@@ -63,6 +63,17 @@ export type SupplierSummary = {
   fields: { key: string; label: string }[];
   offers: { document: string; supplier: string; comparable: boolean; cells: Record<string, SummaryCell> }[];
 };
+export type AbstractBid = { state: string; unit_price: string; amount: string; lowest: boolean };
+export type AbstractOfBids = {
+  project: string; batch: string; site: string; scope: string; prepared: string;
+  items: { number: number; id: string; description: string; quantity: string; unit: string; bids: Record<string, AbstractBid> }[];
+  bidders: {
+    document: string; supplier: string; reference: string; quote_date: string; materials: string; as_read: string;
+    as_calculated: string; coverage: string; vat: string; delivery: string; validity: string; payment: string;
+    rank: string; remarks: string[];
+  }[];
+  lowest: string | null; recommendation: string;
+};
 export type AuditEvent = { id: number; action: string; actor: string; created: string; data: unknown };
 export type AIStatus = { provider: string; configured: boolean };
 
@@ -72,7 +83,7 @@ export type Batch = {
   baseline_document?: string | null; verification_update_available?: boolean;
   verification_problem: string;
   verification_action: { kind: "upload" } | { kind: "type" | "scope" | "retry" | "manage" | "read"; document: string } | null;
-  scope_mode: Scope; scope: string[]; documents: Document[]; issues: Issue[]; comparison: Comparison[]; summary?: SupplierSummary;
+  scope_mode: Scope; scope: string[]; documents: Document[]; issues: Issue[]; comparison: Comparison[]; summary?: SupplierSummary; abstract?: AbstractOfBids;
   reference_links?: ReferenceLink[];
   matches: Record<string, { bom: string | null; candidates: string[]; method: string }>;
   history: AuditEvent[];
@@ -155,10 +166,10 @@ export function documentFeedback(value: string) {
   if (/^The local interpretation found conflicting/i.test(value)) {
     return "The document contains conflicting type indicators. Check the cited sections.";
   }
-  if (/^(?:Confirm sharing with Gemini|AI assistance is disabled)/i.test(value)) {
+  if (/^(?:Confirm sharing with (?:Gemini|Meta)|AI assistance is disabled)/i.test(value)) {
     return "Matching suggestions are unavailable. Select a material manually.";
   }
-  if (/^(?:AI model|Gemini|Local (?:Ollama|model|inference|AI|interpretation)|AI interpretation|The configured model|Configure an installed local Ollama model|Add a Gemini API key)/i.test(value)) {
+  if (/^(?:AI model|Gemini|Meta|Local (?:Ollama|model|inference|AI|interpretation)|AI interpretation|The configured model|Configure an installed local Ollama model|Add a (?:Gemini API key|Meta MODEL_API_KEY))/i.test(value)) {
     if (/quota|rate limit|timeout|timed out|unreachable/i.test(value)) {
       return "Document reading is temporarily unavailable. Try again or review the source.";
     }

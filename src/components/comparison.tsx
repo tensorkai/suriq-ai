@@ -1,13 +1,13 @@
 "use client";
 
 import { History, Table2 } from "lucide-react";
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import { amount, documentFeedback, isBaseline, lineFields, procurementRows, reviews, sourceName, supplierNameNeeded, termFields } from "./model";
-import type { Batch, Document, EvidenceAnchor } from "./model";
+import type { AbstractOfBids, Batch, Document, EvidenceAnchor } from "./model";
 import { Empty, Modal, Pill } from "./shared";
 import { SourceViewer } from "./viewer";
 
-const comparisonViews = ["Overview", "Terms", "Line items"] as const;
+const comparisonViews = ["Overview", "Terms", "Line items", "Abstract of Bids"] as const;
 
 export function SupplierComparison({ batch, openFinding }: { batch: Batch; openFinding: (id: string) => void }) {
   const [view, setView] = useState<typeof comparisonViews[number]>("Overview");
@@ -58,13 +58,15 @@ export function SupplierComparison({ batch, openFinding }: { batch: Batch; openF
       </div>
     </div>
     <div className="inline comparison-controls">
-      <nav className="segment" aria-label="Comparison view">{comparisonViews.map((item) =>
+      <nav className="segment" aria-label="Comparison view">{comparisonViews.filter((item) =>
+        item !== "Abstract of Bids" || batch.abstract).map((item) =>
         <button type="button" key={item} aria-pressed={view === item} onClick={() => setView(item)}>{item}</button>)}</nav>
       {view === "Line items" && <label className="inline">
         <input type="checkbox" checked={exceptions} onChange={(event) => setExceptions(event.target.checked)} /> Exceptions only
       </label>}
     </div>
-    {view === "Overview" ? <div className="table-scroll summary-scroll" tabIndex={0} role="region" aria-label="Supplier Quotation Summary table">
+    {view === "Abstract of Bids" && batch.abstract ? <BidAbstract abstract={batch.abstract} batch={batch.id} /> :
+    view === "Overview" || view === "Abstract of Bids" ? <div className="table-scroll summary-scroll" tabIndex={0} role="region" aria-label="Supplier Quotation Summary table">
       <table className="data-table matrix summary-matrix">
         <thead><tr><th scope="col">Comparison basis</th>{summary.offers.map((offer) => <th scope="col" key={offer.document}>
           {offer.supplier}<small>{offer.comparable ? "Comparable" : "Incomparable"}</small>
@@ -110,7 +112,7 @@ export function SupplierComparison({ batch, openFinding }: { batch: Batch; openF
           {line.fields.material || line.fields.description}<small>{line.fields.code || line.id} · Required {line.fields.material_quantity || line.fields.quantity || "—"} {line.fields.material_unit || line.fields.unit}</small>
         </th>{suppliers.map((row) => {
           const item = row.items[line.id];
-          return <td key={row.document}><Pill value={item?.state ?? "Unknown"} />
+          return <td key={row.document}>{item?.state !== "pass" && <Pill value={item?.state ?? "Unknown"} />}
             {item?.offers.map((offer, index) => <div key={index} className="matrix-offer">
               <strong>{offer.quantity || "—"} {offer.unit} · {amount(offer.unit_price, row.currency)}</strong>
               <small>{[offer.material || offer.description, offer.specification, offer.pack, offer.grade].filter(Boolean).join(" · ")}</small>
@@ -120,6 +122,56 @@ export function SupplierComparison({ batch, openFinding }: { batch: Batch; openF
     </table></div>}
     {sourceDoc && <SourcePreview document={sourceDoc} anchors={source} close={() => setSource([])} />}
   </section>;
+}
+
+const abstractTotals: [string, keyof AbstractOfBids["bidders"][number]][] = [
+  ["Materials total (as calculated)", "materials"], ["Total amount of bid (as read)", "as_read"],
+  ["Total amount of bid (as calculated)", "as_calculated"], ["Coverage", "coverage"], ["VAT basis", "vat"],
+  ["Delivery", "delivery"], ["Validity", "validity"], ["Payment terms", "payment"], ["Rank", "rank"], ["Remarks", "remarks"],
+];
+
+function BidAbstract({ abstract, batch }: { abstract: AbstractOfBids; batch: string }) {
+  return <div className="bid-abstract">
+    <div className="inline abstract-heading">
+      <p>Prepared {abstract.prepared}</p>
+      <a className="button secondary" href={`/api/batches/${batch}/export/abstract`}>Download Abstract of Bids</a>
+    </div>
+    <div className="table-scroll" tabIndex={0} role="region" aria-label="Abstract of Bids table">
+      <table className="data-table abstract-table">
+        <thead>
+          <tr><th scope="col" rowSpan={2} className="compact">No.</th><th scope="col" rowSpan={2} className="compact">Qty</th>
+            <th scope="col" rowSpan={2} className="compact">Unit</th>
+            <th scope="col" rowSpan={2}>Item description</th>
+            {abstract.bidders.map((bidder) => <th scope="colgroup" colSpan={2} key={bidder.document}>{bidder.supplier}</th>)}</tr>
+          <tr>{abstract.bidders.map((bidder) => <Fragment key={bidder.document}>
+            <th scope="col" className="amount">Unit price</th><th scope="col" className="amount">Amount</th></Fragment>)}</tr>
+        </thead>
+        <tbody>{abstract.items.map((item) => <tr key={item.id}>
+          <td className="compact">{item.number}</td><td className="compact">{item.quantity}</td><td className="compact">{item.unit}</td><th scope="row">{item.description}</th>
+          {abstract.bidders.map((bidder) => {
+            const bid = item.bids[bidder.document];
+            const className = `amount${bid.lowest ? " lowest" : ""}`;
+            return <Fragment key={bidder.document}>
+              <td className={className}>{bid.unit_price || "—"}</td>
+              <td className={className}>{bid.amount || "—"}{bid.state !== "pass" && <Pill value={bid.state} />}</td>
+            </Fragment>;
+          })}
+        </tr>)}</tbody>
+        <tfoot>{abstractTotals.map(([label, key]) => <tr key={key}>
+          <th scope="row" colSpan={4}>{label}</th>
+          {abstract.bidders.map((bidder) => {
+            const value = bidder[key];
+            const lowest = bidder.document === abstract.lowest && (key === "as_calculated" || key === "rank");
+            return <td colSpan={2} key={bidder.document} className={lowest ? "lowest" : undefined}>
+              {Array.isArray(value) ? value.length ? <ul>{value.map((note) => <li key={note}>{note}</li>)}</ul> : "None"
+                : value || "Unstated"}</td>;
+          })}
+        </tr>)}</tfoot>
+      </table>
+    </div>
+    <p className="fine-print">Shaded amounts are the lowest compliant price for the item. Items marked mismatch, missing or needs review are excluded from the lowest-price comparison.</p>
+    <p><strong>Recommendation.</strong> {abstract.recommendation}</p>
+  </div>;
 }
 
 function SourcePreview({ document, anchors, close }: { document: Document; anchors: EvidenceAnchor[]; close: () => void }) {

@@ -393,3 +393,41 @@ def test_line_total_error_and_ambiguous_vat_stay_separate(tmp_path):
         assert {cell for anchor in issue["evidence"] for cell in anchor["cells"]} == {"C2", "E2", "F2"}
         assert result["comparison"][0]["tax_basis"] == "unknown"
         assert result["comparison"][0]["total"] is None
+
+
+def test_hosted_reading_does_not_flag_repeats_labels_or_long_pages(tmp_path, monkeypatch):
+    import json
+
+    from service import meta
+    from service.adaptive import WINDOW_ROWS, Interpretation, Material, TermField, reconcile
+
+    # A full page of rows fits the schema the model must answer with.
+    row = Material(origin="e1", fields=[{"field": "material", "element": "e1", "value": "Bar"}])
+    Interpretation(role="quote", rationale="Quote", evidence=[], rows=[row] * WINDOW_ROWS, terms=[])
+    # "Label: value" resolves to the parser's labeled value with its certain anchor.
+    elements = {"e1": (1, {"text": "Freight: Included", "source": 1, "weak": False}, None)}
+    _, terms = reconcile(Interpretation(role="unknown", rationale="Terms", evidence=[], rows=[], terms=[
+        TermField(field="freight", element="e1", value="Freight: Included")]), elements, 1)
+    assert [(field, value, anchor["weak"]) for field, value, anchor in terms] == [("freight", "Included", False)]
+
+    def send(request, timeout):
+        payload = json.loads(json.loads(request.data)["messages"][1]["content"][0]["text"])
+        name = next((item for item in payload["elements"] if BOM[1] in item["text"]), None)
+        answer = {"role": "unknown", "rationale": "No rows", "evidence": [], "terms": [], "rows": []} if not name else {
+            "role": "bom", "rationale": "Material list", "evidence": [name["id"]], "terms": [], "rows": [{
+            "origin": name["id"], "kind": "material", "fields": [
+                {"field": "material", "element": name["id"], "value": BOM[1]},
+                {"field": "description", "element": name["id"], "value": BOM[1]}]}]}
+        return {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(answer)}}]}
+
+    monkeypatch.setenv("SURIQ_AI_PROVIDER", "meta")
+    monkeypatch.setenv("MODEL_API_KEY", "test-key")
+    monkeypatch.setattr(meta, "send", send)
+    with TestClient(create_app(tmp_path / "workspace.sqlite")) as client:
+        batch = create(client)
+        key = ok(add(client, batch, "BOM.pdf", pdf([BOM])))["id"]
+        doc = next(item for item in ok(client.get(f"/batches/{batch}"))["documents"] if item["id"] == key)
+        assert doc["provenance"]["inference"] == "processed"
+        # The model repeated the parsed name; that repeat must not add an unconfirmed field.
+        assert "description" not in doc["lines"][0]["fields"]
+        assert not any(anchor.get("weak") for anchor in doc["lines"][0]["anchors"].values())

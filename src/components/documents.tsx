@@ -20,6 +20,17 @@ export function canChangeType(doc: Document) {
     && !doc.superseded_by && doc.bundle_active !== false && !doc.bundle && !doc.classification?.bundled_offers?.length;
 }
 
+// The classifier assigns each upload its role; the rail groups by that role.
+const documentGroups: [string, (doc: Document) => boolean][] = [
+  ["BOM / BOQ", (doc) => isBaseline(doc)],
+  ["Supplier quotations", (doc) => doc.role === "quote"],
+  ["Other documents", (doc) => !isBaseline(doc) && doc.role !== "quote"],
+];
+
+function supplierLabel(doc: Document) {
+  return supplierNameNeeded(doc.supplier) ? "Supplier quotation" : doc.supplier;
+}
+
 export function Documents({ batch, update, upload, revise, manage, destination, onEditorClose }: {
   destination?: DocumentDestination; onEditorClose?: () => void;
   batch: Batch; update: (value: Batch) => void; upload: () => void; revise: (doc: Document) => void; manage: (doc: Document) => void;
@@ -88,12 +99,21 @@ export function Documents({ batch, update, upload, revise, manage, destination, 
   return <div className="documents-layout">
     <aside className="document-rail">
       <div className="issue-rail-heading"><span>Documents</span><span>{batch.documents.length}</span></div>
-      {batch.documents.map((item) => <button key={item.id} className={`document-choice ${doc.id === item.id ? "selected" : ""}`}
-        type="button" aria-current={doc.id === item.id ? "true" : undefined}
-        onClick={() => open(item.id)}>
-        <span className={`file-glyph ${item.role}`}><FileText size={17} /></span>
-        <span><strong>{docName(item)}</strong><small>{item.name}</small><span className="document-status">{item.status === "processing" && <Spinner />}{item.bundle_active === false ? "Historical split" : item.superseded_by ? "Superseded" : statusLabel[item.status]}</span></span>
-      </button>)}
+      {documentGroups.map(([label, test]) => {
+        const items = batch.documents.filter(test);
+        const baselines = label === "BOM / BOQ";
+        return items.length > 0 && <section key={label} className="document-group" aria-label={label}>
+          <h3>{label}<span>{items.length}</span></h3>
+          {baselines && boms.length > 1 && !bom && <button className="text-button" type="button" onClick={() => setScope(true)}>
+            {boms.length} baselines found · choose one</button>}
+          {items.map((item) => <button key={item.id} className={`document-choice ${doc.id === item.id ? "selected" : ""}`}
+            type="button" aria-current={doc.id === item.id ? "true" : undefined}
+            onClick={() => open(item.id)}>
+            <span className={`file-glyph ${item.role}`}><FileText size={17} /></span>
+            <span><strong>{item.role === "quote" ? supplierLabel(item) : docName(item)}</strong><small title={item.name}>{item.terms.reference || item.name}</small><span className="document-status">{item.status === "processing" && <Spinner />}{item.bundle_active === false ? "Historical split" : item.superseded_by ? "Superseded" : statusLabel[item.status]}{baselines && boms.length > 1 && bom?.id === item.id && " · Selected baseline"}</span></span>
+          </button>)}
+        </section>;
+      })}
       <button className="button secondary full" type="button" onClick={upload}><Plus size={15} /> Add document</button>
     </aside>
     <section className="document-detail">

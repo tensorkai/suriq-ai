@@ -5,8 +5,8 @@ from io import BytesIO, StringIO
 from xml.sax.saxutils import escape
 
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_RIGHT
-from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+from reportlab.lib.pagesizes import A4, inch, landscape
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.pdfbase.pdfmetrics import registerFont, registerFontFamily
 from reportlab.pdfbase.ttfonts import TTFont
@@ -101,6 +101,8 @@ def report(batch, extension):
         for row in report_rows(batch):
             writer.writerow(spreadsheet_safe(value) for value in row + ("",) * (len(header) - len(row)))
         return output.getvalue().encode("utf-8-sig"), "text/csv"
+    if extension == "abstract":
+        return abstract_pdf(batch), "application/pdf"
     return verification_pdf(batch), "application/pdf"
 
 
@@ -382,4 +384,148 @@ def verification_pdf(batch):
         canvas.restoreState()
 
     report.build(story, onFirstPage=page_number, onLaterPages=page_number)
+    return output.getvalue()
+
+
+def abstract_pdf(batch):
+    """Abstract of Bids on long bond paper, laid out like the Philippine BAC abstract forms."""
+    abstract = batch.get("abstract")
+    if not abstract:
+        raise ValueError("An Abstract of Bids needs at least two supplier quotations.")
+    output = BytesIO()
+    page = landscape((8.5 * inch, 13 * inch))
+    sheet = SimpleDocTemplate(output, title="Abstract of Bids", pagesize=page,
+                              leftMargin=30, rightMargin=30, topMargin=30, bottomMargin=36)
+    ink, green, muted, rule = map(colors.HexColor, ("#1b2d25", "#235741", "#52665b", "#c9d4cc"))
+    bidders = abstract["bidders"]
+    size = 7.2 if len(bidders) > 3 else 8.2
+    base = ParagraphStyle("AbstractCell", fontName=REPORT_FONT, fontSize=size, leading=size + 2.6, textColor=ink)
+    style = {
+        "cell": base,
+        "bold": ParagraphStyle("AbstractBold", parent=base, fontName=REPORT_BOLD),
+        "amount": ParagraphStyle("AbstractAmount", parent=base, alignment=TA_RIGHT),
+        "lowest": ParagraphStyle("AbstractLowest", parent=base, alignment=TA_RIGHT, fontName=REPORT_BOLD, textColor=green),
+        "center": ParagraphStyle("AbstractCenter", parent=base, alignment=TA_CENTER),
+        "head": ParagraphStyle("AbstractHead", parent=base, fontName=REPORT_BOLD, alignment=TA_CENTER, textColor=green),
+        "note": ParagraphStyle("AbstractNote", parent=base, fontSize=size - .6, textColor=muted),
+        "title": ParagraphStyle("AbstractTitle", fontName=REPORT_BOLD, fontSize=16, leading=20, alignment=TA_CENTER,
+                                textColor=ink),
+        "subtitle": ParagraphStyle("AbstractSubtitle", fontName=REPORT_FONT, fontSize=9, leading=12,
+                                   alignment=TA_CENTER, textColor=muted, spaceAfter=10),
+        "label": ParagraphStyle("AbstractLabel", fontName=REPORT_BOLD, fontSize=8.4, leading=11, textColor=muted),
+        "value": ParagraphStyle("AbstractValue", fontName=REPORT_FONT, fontSize=8.4, leading=11, textColor=ink),
+        "body": ParagraphStyle("AbstractBody", fontName=REPORT_FONT, fontSize=9, leading=12.5, textColor=ink),
+    }
+
+    def text(value, kind="cell"):
+        return Paragraph(report_text(value or "—"), style[kind])
+
+    width = sheet.width
+    story = [Paragraph("ABSTRACT OF BIDS", style["title"]),
+             Paragraph("As calculated · after verification of supplier quotations", style["subtitle"])]
+    blank = "_" * 34
+    header = [
+        ("Name of project", abstract["project"], "Date prepared", abstract["prepared"]),
+        ("Batch", abstract["batch"], "Approved budget for the contract", blank),
+        ("Location", abstract["site"] or blank, "Number of bidders", str(len(bidders))),
+        ("Purchase scope", abstract["scope"], "Basis", "PHP · amounts as verified by SuriQ"),
+    ]
+    story.append(Table([[text(a, "label"), text(b, "value"), text(c, "label"), text(d, "value")] for a, b, c, d in header],
+                       colWidths=[width * .14, width * .41, width * .18, width * .27], hAlign="LEFT", style=[
+                           ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                           ("TOPPADDING", (0, 0), (-1, -1), 1.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
+                           ("LEFTPADDING", (0, 0), (-1, -1), 0)]))
+    story.append(Spacer(1, 10))
+
+    fixed = [28, 34, 34]
+    describe = width * (.24 if len(bidders) > 3 else .28)
+    money_width = (width - sum(fixed) - describe) / (2 * len(bidders))
+    columns = [*fixed, describe, *[money_width] * (2 * len(bidders))]
+    first = 4
+    rows = [["No.", "Qty", "Unit", "Item description"], ["", "", "", ""]]
+    commands = [("SPAN", (column, 0), (column, 1)) for column in range(first)]
+    for index, bidder in enumerate(bidders):
+        column = first + 2 * index
+        rows[0] += [bidder["supplier"], ""]
+        rows[1] += ["Unit price", "Amount"]
+        commands.append(("SPAN", (column, 0), (column + 1, 0)))
+    body = [[text(value, "head") for value in row] for row in rows]
+    shade = colors.HexColor("#e2f0e5")
+    for item in abstract["items"]:
+        line = [text(item["number"], "center"), text(item["quantity"], "center"), text(item["unit"], "center"),
+                text(item["description"])]
+        for index, bidder in enumerate(bidders):
+            bid = item["bids"][bidder["document"]]
+            note = "" if bid["state"] == "pass" else f'<br/><font color="#744810" size="{size - 1}">' \
+                f'{report_text(bid["state"].capitalize())}</font>'
+            kind = "lowest" if bid["lowest"] else "amount"
+            line += [Paragraph(report_text(bid["unit_price"] or "—"), style[kind]),
+                     Paragraph(report_text(bid["amount"] or "—") + note, style[kind])]
+            if bid["lowest"]:
+                column, row = first + 2 * index, len(body)
+                commands.append(("BACKGROUND", (column, row), (column + 1, row), shade))
+        body.append(line)
+
+    totals_start = len(body)
+    summary = [("Materials total (as calculated)", "materials", "amount"),
+               ("Total amount of bid (as read)", "as_read", "amount"),
+               ("Total amount of bid (as calculated)", "as_calculated", "lowest"),
+               ("Coverage", "coverage", "cell"), ("VAT basis", "vat", "cell"), ("Delivery", "delivery", "cell"),
+               ("Validity", "validity", "cell"), ("Payment terms", "payment", "cell"),
+               ("Rank", "rank", "bold"), ("Remarks", "remarks", "note")]
+    for label, key, kind in summary:
+        row = len(body)
+        line = [text(label, "bold"), "", "", ""]
+        commands.append(("SPAN", (0, row), (first - 1, row)))
+        for index, bidder in enumerate(bidders):
+            value = bidder[key]
+            value = "\n".join(value) if isinstance(value, list) else value
+            lowest = bidder["document"] == abstract["lowest"]
+            line += [text(value or ("None" if key == "remarks" else "Unstated"),
+                          kind if kind != "lowest" or lowest else "amount"), ""]
+            column = first + 2 * index
+            commands.append(("SPAN", (column, row), (column + 1, row)))
+            if lowest and key in {"as_calculated", "rank"}:
+                commands.append(("BACKGROUND", (column, row), (column + 1, row), shade))
+        body.append(line)
+
+    story.append(LongTable(body, colWidths=columns, repeatRows=2, hAlign="LEFT", style=[
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("VALIGN", (0, 0), (-1, 1), "MIDDLE"),
+        ("GRID", (0, 0), (-1, -1), .45, rule),
+        ("BOX", (0, 0), (-1, -1), .9, ink),
+        ("BACKGROUND", (0, 0), (-1, 1), colors.HexColor("#e8f1eb")),
+        ("LINEABOVE", (0, totals_start), (-1, totals_start), .9, ink),
+        ("BACKGROUND", (0, totals_start), (first - 1, -1), colors.HexColor("#f4f7f4")),
+        ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4), ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        *commands,
+    ]))
+    story.append(Spacer(1, 6))
+    story.append(text("Shaded amounts are the lowest compliant price for the item. Items marked mismatch, missing or "
+                      "needs review are excluded from the lowest-price comparison.", "note"))
+    story.append(Spacer(1, 10))
+    story.append(Paragraph(f"<b>Recommendation.</b> {report_text(abstract['recommendation'])}", style["body"]))
+    story.append(Spacer(1, 26))
+
+    def signer(role):
+        return [text(role, "label"), Spacer(1, 26), HRFlowable(width="88%", thickness=.6, color=ink, hAlign="LEFT"),
+                text("Signature over printed name", "note"), Spacer(1, 12),
+                HRFlowable(width="88%", thickness=.6, color=ink, hAlign="LEFT"), text("Designation and date", "note")]
+    story.append(CondPageBreak(120))
+    story.append(Table([[signer("Prepared by"), signer("Reviewed by"), signer("Approved by")]],
+                       colWidths=[width / 3] * 3, hAlign="LEFT",
+                       style=[("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0)]))
+
+    def footer(canvas, doc):
+        canvas.saveState()
+        canvas.setStrokeColor(rule)
+        canvas.line(doc.leftMargin, 26, doc.pagesize[0] - doc.rightMargin, 26)
+        canvas.setFillColor(muted)
+        canvas.setFont(REPORT_FONT, 7.5)
+        canvas.drawString(doc.leftMargin, 14, "SuriQ · Abstract of Bids · for human review before purchase approval")
+        canvas.drawRightString(doc.pagesize[0] - doc.rightMargin, 14, f"Page {doc.page}")
+        canvas.restoreState()
+
+    sheet.build(story, onFirstPage=footer, onLaterPages=footer)
     return output.getvalue()

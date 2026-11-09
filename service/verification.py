@@ -165,7 +165,7 @@ def summary_quote(doc):
     return any((amount := monetary_value(doc["terms"].get(field, ""))) is not None and amount[1] >= 0
                and (anchor := evidence(doc, field=field)) and (
                    not anchor.get("weak") or anchor.get("method") == "model"
-                   and doc.get("provenance", {}).get("provider") == "gemini"
+                   and doc.get("provenance", {}).get("provider") in {"gemini", "meta"}
                )
                for field in ("materials_total", "total"))
 

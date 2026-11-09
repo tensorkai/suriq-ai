@@ -140,6 +140,10 @@ svg { flex-shrink: 0; }
 .document-status .spinner { width: 10px; height: 10px; }
 .file-glyph { color: #48715a; padding: 3px; border-radius: 4px; background: #f1f6ef; }
 .document-rail > .button { margin-top: 9px; }
+.document-group { padding-bottom: 8px; margin-bottom: 8px; border-bottom: 1px solid var(--line); }
+.document-group h3 { display: flex; justify-content: space-between; margin: 6px 4px 2px; color: var(--green); font-size: 11px; font-weight: 720; letter-spacing: .04em; text-transform: uppercase; }
+.document-group h3 span { color: var(--muted); }
+.document-group > .text-button { display: block; margin: 2px 4px; font-size: 11px; color: var(--amber); }
 .document-detail, .issue-content, .comparison { min-width: 0; padding: var(--workspace-inset); }
 .detail-heading { display: flex; align-items: start; justify-content: space-between; gap: 12px; margin-bottom: 15px; }
 .detail-heading h2 { margin-top: 4px; overflow-wrap: anywhere; }
@@ -321,6 +325,18 @@ svg { flex-shrink: 0; }
 
 .comparison-controls { justify-content: space-between; margin-bottom: 12px; }
 .summary-scroll { border: 1px solid var(--line); border-radius: 8px; }
+.abstract-heading { justify-content: space-between; flex-wrap: wrap; margin-bottom: 8px; }
+.abstract-heading p { margin: 0; color: var(--muted); }
+.abstract-table { font-size: 12px; }
+.abstract-table thead th { text-align: center; border: 1px solid #dce6dd; }
+.abstract-table tbody th { font-weight: 500; min-width: 200px; }
+.abstract-table .compact { width: 1%; white-space: nowrap; overflow-wrap: normal; }
+.abstract-table .amount { text-align: right; white-space: nowrap; font-family: var(--mono); }
+.abstract-table td.amount .pill { display: flex; width: fit-content; margin: 3px 0 0 auto; }
+.abstract-table .lowest { background: #e2f0e5; color: var(--deep); font-weight: 700; }
+.abstract-table tfoot th { text-align: left; background: #f4f7f4; }
+.abstract-table tfoot tr:first-child > * { border-top: 2px solid var(--ink); }
+.abstract-table tfoot ul { padding-left: 14px; margin: 0; list-style: disc; color: var(--muted); }
 .summary-matrix th:first-child { min-width: 132px; width: 17%; }
 .summary-matrix td { min-width: 185px; }
 .summary-value { white-space: pre-line; overflow-wrap: anywhere; }

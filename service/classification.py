@@ -34,7 +34,7 @@ def classify(snapshot):
                  if field in snapshot["term_anchors"] and (
                      not snapshot["term_anchors"][field].get("weak")
                      or snapshot["term_anchors"][field].get("method") == "model"
-                     and snapshot.get("provenance", {}).get("provider") == "gemini"
+                     and snapshot.get("provenance", {}).get("provider") in {"gemini", "meta"}
                  )
                  and re.fullmatch(r"(?:(?:[A-Z]{3}\.?|₱)\s*)?\d[\d,]*(?:\.\d+)?", snapshot["terms"].get(field, ""), re.I)]
     prices = [row["anchors"][field] for row in lines for field in ("unit_price", "amount")

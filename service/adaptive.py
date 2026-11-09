@@ -45,8 +45,12 @@ HOSTED_INSTRUCTIONS = (
     "text, or page numbers, in evidence, origin and element. Evidence is a list of IDs for the document heading, "
     "or empty if there is no heading in this window. Each field entry contains field, element and verbatim value. "
     "For dates and durations, copy the whole clause including calendar or business basis, trigger, cutoff and conditions. "
+    "For a term, copy only the value after its printed label, never the label itself. "
+    "Put an item name in material only; use description only when the row has no separate material name. "
     "Keep rationale under 15 words. Avoid duplicate rows and terms."
 )
+# Each request carries at most this many visual rows; the schema must allow a row for each.
+WINDOW_ROWS = 48
 NUMERIC_TOKEN = re.compile(r"(?<![\w.,])(?:(?:PHP\.?|₱)\s*)?-?\d[\d,]*(?:\.\d+)?(?!\w|[.,]\d)", re.I)
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
 
@@ -78,7 +82,7 @@ class Interpretation(Strict):
     role: Literal["bom", "quote", "unknown", "mixed"]
     rationale: Annotated[Text, Field(max_length=120)]
     evidence: list[str] = Field(max_length=6, description="Exact supplied heading element IDs, such as e0")
-    rows: list[Material] = Field(max_length=32)
+    rows: list[Material] = Field(max_length=WINDOW_ROWS)
     terms: list[TermField] = Field(max_length=len(TERM_FIELDS))
 
 
@@ -124,7 +128,9 @@ def labeled_term(citation, elements, source):
             values.append(term)
     literal = r"\s+".join(re.escape(part) for part in citation.value.split())
     labeled = [(field, value, anchor) for field, value, anchor in values
-               if re.search(r"(?<![\w.,])" + literal + r"(?!\w|[.,]\d)", value, re.I)]
+               if re.search(r"(?<![\w.,])" + literal + r"(?!\w|[.,]\d)", value, re.I)
+               # The model sometimes copies "Label: value"; the parser already owns that value.
+               or re.search(r":\s*" + r"\s+".join(map(re.escape, value.split())) + r"\s*$", citation.value, re.I)]
     if not labeled:
         return None
     return next((item for item in labeled if item[0] == citation.field), labeled[0])
@@ -237,7 +243,7 @@ def source_elements(source, pdf_words, *, hosted=False):
 def assist(snapshot, path, directory, pdf_words, classification, on_inference):
     provenance = snapshot["provenance"]
     provenance["intake_schema"] = VERSION
-    hosted = inference.provider() == "gemini"
+    hosted = inference.hosted()
     if classification["role"] == "unsupported" or (classification.get("summary_only") and not hosted):
         return
     lines_by_source = {}
@@ -267,7 +273,7 @@ def assist(snapshot, path, directory, pdf_words, classification, on_inference):
         provenance["inference"] = "disabled"
         return
     provider = inference.provider()
-    label = "Gemini" if provider == "gemini" else "Local model"
+    label = {"gemini": "Gemini", "meta": "Meta"}.get(provider, "Local model")
     model = backend.model_name()
     temperature = 0.2 if hosted else 0
     provenance.update({"provider": provider, "model": model, "inference": "running", "temperature": temperature,
@@ -297,8 +303,8 @@ def assist(snapshot, path, directory, pdf_words, classification, on_inference):
             windows = []
             if hosted:
                 # Keep visual rows and their cells together in each request.
-                for start in range(0, elements[-1][0] if elements else 1, 48):
-                    windows.append([item for item in elements if start < item[0] <= start + 48])
+                for start in range(0, elements[-1][0] if elements else 1, WINDOW_ROWS):
+                    windows.append([item for item in elements if start < item[0] <= start + WINDOW_ROWS])
                 windows = [window for window in windows if window]
             else:
                 windows = [elements[start:start + 48] for start in range(0, max(1, len(elements)), 48)]
@@ -345,7 +351,10 @@ def assist(snapshot, path, directory, pdf_words, classification, on_inference):
                 for line in rows.values():
                     existing = native.get(line["id"])
                     if existing:
+                        known = {re.sub(r"\s+", " ", text).casefold() for text in existing["fields"].values()}
                         for field, value in line["fields"].items():
+                            if field not in existing["fields"] and re.sub(r"\s+", " ", value).casefold() in known:
+                                continue  # Repeats a value the parser already read with certain evidence.
                             if field not in existing["fields"]:
                                 existing["fields"][field] = value
                                 existing["anchors"][field] = line["anchors"][field]

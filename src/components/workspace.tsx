@@ -222,6 +222,7 @@ export function Workspace() {
                   <div>
                     <a href={`/api/batches/${active.id}/export/pdf`}>Download PDF</a>
                     <a href={`/api/batches/${active.id}/export/csv`}>Download CSV</a>
+                    {active.abstract && <a href={`/api/batches/${active.id}/export/abstract`}>Abstract of Bids (PDF)</a>}
                     {active.documents.filter((doc) => doc.kind === "xlsx" && !doc.superseded_by).map((doc) =>
                       <a key={doc.id} href={`/api/documents/${doc.id}/export/xlsx`}>Annotated Excel · {doc.name}</a>)}
                   </div>
@@ -329,7 +330,7 @@ function UploadDialog({ batch, revises, update, close }: {
   const [busy, setBusy] = useState(false);
   const [files, setFiles] = useState<File[]>([]);
   const [uploaded, setUploaded] = useState(0);
-  const hostedReading = batch.ai.provider === "gemini" && batch.ai.configured;
+  const hostedReading = (batch.ai.provider === "gemini" || batch.ai.provider === "meta") && batch.ai.configured;
   return <Modal title={revises ? "Upload revised quotation" : "Add purchase and quotation files"} close={close} busy={busy}>
     <form className="modal-body stack" onSubmit={async (event) => {
       event.preventDefault(); setBusy(true); setUploaded(0); setError("");
@@ -358,7 +359,7 @@ function UploadDialog({ batch, revises, update, close }: {
         <input type="file" name="file" accept=".pdf,.xlsx,.docx" multiple={!revises} disabled={busy}
           onChange={(event) => setFiles(Array.from(event.currentTarget.files ?? []))} /></label>
       {files.length > 0 && <p className="muted">{files.map((file) => file.name).join(", ")}</p>}
-      {hostedReading && <p className="fine-print">Google processes document excerpts and page images to read these files.</p>}
+      {hostedReading && <p className="fine-print">{batch.ai.provider === "meta" ? "Meta" : "Google"} processes document excerpts and page images to read these files.</p>}
       {busy && <div className="upload-progress">
         <div className="inline" role="status"><Spinner />{uploaded < files.length
           ? `Uploading file ${uploaded + 1} of ${files.length}` : "Opening uploaded files…"}</div>

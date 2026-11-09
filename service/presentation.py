@@ -291,3 +291,78 @@ def add_presentation(batch):
               or any(offer["cells"][key]["value"] for offer in offers)]
     batch["summary"] = {"project": batch["project_name"], "site": site, "scope": scope, "exclusions": exclusions,
                         "verified": manila_stamp(batch["verified_at"]), "fields": fields, "offers": offers}
+    if baseline and len(offers) > 1:
+        batch["abstract"] = abstract_of_bids(batch, baseline, rows, offers)
+
+
+def abstract_amount(value):
+    if not value:
+        return None
+    text = re.sub(r"^(?:PHP\.?|₱)\s*", "", str(value).strip(), flags=re.I).replace(",", "")
+    try:
+        return Decimal(text)
+    except ArithmeticError:
+        return None
+
+
+def abstract_of_bids(batch, baseline, rows, offers):
+    """Itemized Abstract of Bids (as calculated): baseline items x supplier unit price and amount."""
+    comparison = {row["document"]: row for row in batch["comparison"]}
+    boq = is_boq(baseline)
+    items = []
+    for number, line in enumerate(rows, 1):
+        fields = material_line(line)["fields"] if boq else line["fields"]
+        bids = {}
+        for offer in offers:
+            row = comparison[offer["document"]]
+            item = row["items"].get(line["id"])
+            quoted = (item or {}).get("offers") or []
+            amounts = [abstract_amount(entry.get("amount")) for entry in quoted]
+            total = sum(amounts) if quoted and None not in amounts else None
+            bids[offer["document"]] = {
+                "state": item["state"] if item else "not offered",
+                "unit_price": "\n".join(dict.fromkeys(filter(None, (
+                    money_display(entry.get("unit_price"), row["currency"]) for entry in quoted)))),
+                "amount": money_display(str(total), row["currency"]) if total is not None else "",
+                "value": total, "lowest": False,
+            }
+        priced = [bid["value"] for bid in bids.values() if bid["state"] == "pass" and bid["value"] is not None]
+        for bid in bids.values():
+            bid["lowest"] = bool(priced) and bid["state"] == "pass" and bid["value"] == min(priced)
+            del bid["value"]
+        items.append({"number": number, "id": line["id"],
+                      "description": " · ".join(filter(None, (fields.get("code"), fields.get("material")
+                                                               or fields.get("description"), fields.get("specification")))),
+                      "quantity": fields.get("quantity", ""), "unit": fields.get("unit", ""), "bids": bids})
+
+    ranked = sorted((abstract_amount(comparison[offer["document"]]["total"]), offer["document"])
+                    for offer in offers if offer["comparable"])
+    rank = {document: index for index, (_, document) in enumerate(ranked, 1)}
+    bidders = []
+    for offer in offers:
+        row, cells = comparison[offer["document"]], offer["cells"]
+        place = rank.get(offer["document"])
+        remarks = list(cells["payable"]["reasons"])
+        if (count := len(cells["findings"]["findings"])):
+            remarks.append(f"{count} open material {'finding' if count == 1 else 'findings'}")
+        bidders.append({
+            "document": offer["document"], "supplier": offer["supplier"],
+            "reference": cells["reference"]["value"], "quote_date": cells["quote_date"]["value"],
+            "materials": money_display(row["line_sum"], row["currency"]),
+            "as_read": cells["quoted_total"]["value"],
+            "as_calculated": cells["payable"]["value"],
+            "coverage": cells["coverage"]["value"], "vat": row["tax_basis"],
+            "delivery": cells["delivery"]["value"], "validity": cells["validity"]["value"],
+            "payment": cells["payment"]["value"],
+            "rank": (f"{place}{'st' if place == 1 else 'nd' if place == 2 else 'rd' if place == 3 else 'th'}"
+                     + (" · Lowest calculated bid" if place == 1 else "")) if place else "Not ranked",
+            "remarks": remarks,
+        })
+    lowest = next((bidder for bidder in bidders if rank.get(bidder["document"]) == 1), None)
+    recommendation = (f"{lowest['supplier']} has the lowest calculated comparable bid at {lowest['as_calculated']}. "
+                      "Award is subject to review of open findings and approval."
+                      if lowest else "No bid is ranked: none of the offers has a comparable payable total.")
+    return {"project": batch["project_name"], "batch": batch["name"],
+            "site": batch["summary"]["site"], "scope": batch["summary"]["scope"],
+            "prepared": manila_stamp(batch["verified_at"]), "items": items, "bidders": bidders,
+            "lowest": lowest["document"] if lowest else None, "recommendation": recommendation}

@@ -68,6 +68,23 @@ def test_summary_and_structured_pdf_share_verified_values(tmp_path, offer_count)
         assert re.search(r"Source and location +Evidence excerpt", extracted)
         assert re.search(r"Confirm the drawing revision\.\s*\n\s*Ask whether the replacement is in stock\.", extracted)
         assert "Materials B2" in extracted
+        abstract = client.get(f"{route}/export/abstract")
+        if offer_count == 1:
+            assert "abstract" not in loaded and abstract.status_code == 409
+        else:
+            bids = loaded["abstract"]
+            assert len(bids["items"]) == 28 and len(bids["bidders"]) == 5
+            first_offer = next(bidder["document"] for bidder in bids["bidders"] if bidder["reference"] == "QUOTE-1")
+            cheapest = next(bidder for bidder in bids["bidders"] if bidder["reference"] == "QUOTE-2")
+            assert bids["lowest"] == cheapest["document"] and cheapest["rank"].startswith("1st")
+            assert all(item["bids"][cheapest["document"]]["lowest"] for item in bids["items"])
+            assert not any(item["bids"][first_offer]["lowest"] for item in bids["items"])  # mismatched size
+            assert abstract.is_success and abstract.headers["content-type"] == "application/pdf"
+            sheet = run(["pdftotext", "-layout", "-", "-"], input=abstract.content,
+                        capture_output=True, check=True).stdout.decode()
+            for label in ("ABSTRACT OF BIDS", "Total amount of bid (as calculated)", "1st · Lowest",
+                          "Prepared by", "Approved by"):
+                assert label in sheet
         machine_readable = client.get(f"{route}/export/csv").content.decode("utf-8-sig")
         header, *records = csv.reader(StringIO(machine_readable))
         assert all(len(row) == len(header) for row in records)

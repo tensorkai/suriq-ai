@@ -30,6 +30,8 @@ from service.suggestions import suggest
 from service.verification import decimal_value, one_schedule, schedule_baseline, summary_quote, verify
 from service.workbook_export import WorkbookExportError, annotated_workbook
 
+# Context-only terms; an unconfirmed reading of these does not affect pricing or comparison.
+INFORMATIONAL_TERMS = {"project_site", "scope_reference"}
 MAX_UPLOAD = int(os.getenv("SURIQ_MAX_UPLOAD_MB", "20")) * 1024 * 1024
 LOG = logging.getLogger("suriq")
 Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)]
@@ -360,7 +362,7 @@ def create_app(path):
         try:
             def interpreting():
                 with store.connection(write=True) as db:
-                    step = "Gemini interpretation" if provider() == "gemini" else "Local AI interpretation"
+                    step = {"gemini": "Gemini interpretation", "meta": "Meta interpretation"}.get(provider(), "Local AI interpretation")
                     db.execute("UPDATE documents SET processing_step = ? WHERE id = ?", (step, doc_id))
 
             snapshot = extract(doc["original"], doc["kind"], on_inference=interpreting)
@@ -374,7 +376,8 @@ def create_app(path):
                            or doc["intake"] == "auto" and classification["role"] == "unknown")
             status = "needs_review" if (
                 error or role_review or any(source["warning"] for source in snapshot["sources"])
-                or any(anchor.get("weak") for anchor in snapshot["term_anchors"].values())
+                or any(anchor.get("weak") for field, anchor in snapshot["term_anchors"].items()
+                       if field not in INFORMATIONAL_TERMS)
                 or any(anchor.get("weak") for line in snapshot["lines"] for anchor in line["anchors"].values())
             ) else "ready"
         except ExtractionError as exc:
@@ -977,14 +980,17 @@ def create_app(path):
             return load_batch(db, batch)
 
     @app.get("/batches/{batch}/export/{extension}")
-    def export(batch: str, extension: Literal["pdf", "csv"]):
+    def export(batch: str, extension: Literal["pdf", "csv", "abstract"]):
         with store.connection() as db:
             view = load_batch(db, batch)
         if not view["verified_at"] or view["stale"]:
             fail(409, "Verify this batch before exporting.")
+        if extension == "abstract" and not view.get("abstract"):
+            fail(409, "An Abstract of Bids needs at least two supplier quotations.")
         content, mime = report(view, extension)
+        filename = "suriq-abstract-of-bids.pdf" if extension == "abstract" else f"suriq-verification.{extension}"
         return Response(content, media_type=mime, headers={
-            "Content-Disposition": f'attachment; filename="suriq-verification.{extension}"',
+            "Content-Disposition": f'attachment; filename="{filename}"',
         })
 
     @app.get("/documents/{key}/export/xlsx")
