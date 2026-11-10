@@ -82,6 +82,10 @@ def classify(snapshot):
     elif (offers or proposed_offer) and summaries and not lines:
         role, basis = "quote", "Quotation heading and priced summary are present. The offer is not itemized."
         evidence += summaries + proposed_offer
+    elif lines and (offers or proposed_offer) and not prices and not summaries and "supplier" not in native_offer_terms:
+        role, basis = "unknown", ("Quotation layout without offered prices or a supplier. "
+                                  "It may be a blank response form. Classify it before comparison.")
+        evidence += offers + quantities[:3] + proposed_offer
     elif lines and (offers or proposed_offer or (prices and native_offer_terms)):
         role, basis = "quote", "An offer heading or commercial terms accompany the material lines."
         evidence += prices[:3] + proposed_offer

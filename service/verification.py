@@ -26,6 +26,10 @@ METRIC = {
     "mm": ("length", Decimal(".001")), "cm": ("length", Decimal(".01")), "m": ("length", Decimal(1)),
 }
 PACK_UNITS = {"bags", "sacks", "lengths", "sets", "rolls", "packs", "pails"}
+# Units SuriQ can read; anything else is flagged on the BOM so nobody assumes a conversion.
+KNOWN_UNITS = PACK_UNITS | {"pcs", "sqm", "cum", "l", "lot", "lots", "unit", "units", "ea", "each", "box", "boxes",
+                            "gal", "gallon", "gallons", "ft", "in", "inch", "sheet", "sheets", "pair", "pairs",
+                            "can", "cans", "tube", "tubes", "bd ft", "bdft", "lm", "ln m", "km", "t", "assy"}
 RULES = {
     "dimension": "Dimension mismatch", "grade": "Grade requirement", "standard": "Standard requirement",
     "brand": "Required brand", "specification": "Specification mismatch", "material": "Material mismatch",
@@ -40,6 +44,7 @@ RULES = {
     "materials_reconciliation": "Materials reconciliation needs review",
     "materials_price_variance": "Materials price variance",
     "work_scope": "BOQ work item needs material breakdown",
+    "baseline": "BOM line needs clarification",
 }
 
 
@@ -134,10 +139,13 @@ def pack_size(value):
 
 def best_matches(line, baseline):
     code = norm(line["fields"].get("code", ""))
-    by_code = [item["id"] for item in baseline if code and norm(item["fields"].get("code", "")) == code]
+    name = identity(line)
+    sequential = bool(re.fullmatch(r"[\d ]+", code))
+    # A plain row number (1, 2, 3.1) is a position, not a material identity: the names must agree too.
+    by_code = [item["id"] for item in baseline if code and norm(item["fields"].get("code", "")) == code
+               and (not sequential or set(name.split()) & set(identity(item).split()))]
     if by_code:
         return by_code, "item ID"
-    name = identity(line)
     by_name = [item["id"] for item in baseline if name and identity(item) == name]
     if len(by_name) > 1:
         specs = {field: attribute_value(field, line["fields"][field]) for field in ATTRIBUTES
@@ -511,6 +519,26 @@ def verify_in_context(documents, scope_mode, scope, as_of):
             add("extraction", doc["id"], "no rows", "No material rows were recognized.", "Warning",
                 source_evidence(doc), review=True)
 
+    codes = defaultdict(list)
+    for line in baseline.values():
+        fields = line["fields"]
+        quantity, measure = decimal_value(fields.get("quantity", "")), unit(fields.get("unit", ""))
+        if quantity is not None and quantity <= 0:
+            add("baseline", line["id"], "quantity", "The BOM quantity is zero or negative.", "Warning",
+                [evidence(bom, line, "quantity")], review=True,
+                detail={"observed": fields["quantity"], "action": "Confirm the required quantity with the requester."})
+        if measure and measure not in KNOWN_UNITS and measure not in METRIC:
+            add("baseline", line["id"], "unit", f"Unit \"{fields['unit']}\" is not recognized, so no conversion is applied.",
+                "Info", [evidence(bom, line, "unit")], review=True,
+                detail={"observed": fields["unit"], "action": "Confirm the unit or correct the BOM row."})
+        if (code := norm(fields.get("code", ""))) and not re.fullmatch(r"[\d ]+", code):
+            codes[code].append(line)
+    for code, lines in codes.items():
+        if len({identity(line) for line in lines}) > 1:
+            add("baseline", code, "duplicate item ID", f"Item ID {lines[0]['fields']['code']} is used for different materials.",
+                "Warning", [evidence(bom, line) for line in lines], review=True,
+                detail={"observed": lines[0]["fields"]["code"], "action": "Give each BOM material its own item ID."})
+
     for supplier, group in supplier_docs.items():
         if len(group) > 1:
             add("supplier_duplicate", supplier, "multiple quotes", "The same supplier is assigned multiple offers.",
@@ -599,13 +627,14 @@ def verify_in_context(documents, scope_mode, scope, as_of):
                 expected = expected or "unspecified"
                 actual = actual or "unspecified"
                 weak = any(anchor and anchor.get("weak") for anchor in anchors)
-                add(rule, key, [attribute_value(rule, expected), attribute_value(rule, actual)],
+                issue = add(rule, key, [attribute_value(rule, expected), attribute_value(rule, actual)],
                     f"{item} requires {expected[:66]}, while the offer lists {actual[:66]}.",
                     "Warning" if review or weak else "Blocking", anchors, review=review)
                 if not review and not weak:
                     state = "mismatch"
                 elif state == "pass":
                     state = "needs review"
+                return issue
 
             if identity(line) and identity(offer) and identity(line) != identity(offer):
                 field = "material" if bf.get("material") else "description"
@@ -627,8 +656,12 @@ def verify_in_context(documents, scope_mode, scope, as_of):
             u1, u2 = [unit(f.get("unit", "")) for f in (bf, qf)]
             p1, p2 = [pack_size(f.get("pack", "")) for f in (bf, qf)]
             override = decimal_value(offer.get("factor", ""))
-            if u1 in PACK_UNITS and u2 in PACK_UNITS and p1 and p2 and p1 != p2:
-                difference("pack", bf["pack"], qf["pack"])
+            repacked = u1 in PACK_UNITS and u2 in PACK_UNITS and p1 and p2 and p1 != p2
+            if repacked:
+                issue = difference("pack", bf["pack"], qf["pack"])
+                if p1[1] == p2[1] and q1 and q2 and q1 * p1[0] == q2 * p2[0] and "Same total" not in issues[issue]["note"]:
+                    issues[issue]["note"] += (f" Same total of {decimal_text(q1 * p1[0])} {p1[1]}"
+                                              " in a different bag size. Approve the substitution.")
             elif not override and (u1 in PACK_UNITS or u2 in PACK_UNITS) and (
                 bool(p1) != bool(p2) or (u1 in {"bags", "sacks"} and u2 in {"bags", "sacks"} and not (p1 and p2))
             ):
@@ -640,6 +673,10 @@ def verify_in_context(documents, scope_mode, scope, as_of):
                 if q1 != q2 * override:
                     difference("quantity", f"{decimal_text(q1)} {u1}",
                                f"{decimal_text(q2 * override)} {u1} (reviewer conversion)")
+            elif repacked and p1[1] == p2[1]:
+                # Different bag sizes: compare the physical total (100 x 40 kg = 80 x 50 kg), not the bag count.
+                if q1 * p1[0] != q2 * p2[0]:
+                    difference("quantity", f"{decimal_text(q1 * p1[0])} {p1[1]}", f"{decimal_text(q2 * p2[0])} {p2[1]}")
             elif u1 and (u1 == u2 or (u1 in {"bags", "sacks"} and u2 in {"bags", "sacks"} and p1 and p1 == p2)):
                 if q1 != q2:
                     difference("quantity", f"{decimal_text(q1)} {u1}", f"{decimal_text(q2)} {u1}")

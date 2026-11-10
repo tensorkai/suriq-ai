@@ -36,6 +36,7 @@ def test_gemini_reads_uploads_and_retries_without_permission(tmp_path, monkeypat
                         {"field": "material", "element": row, "value": "Anchor bolts"},
                         {"field": "quantity", "element": row, "value": "50"},
                         {"field": "unit", "element": row, "value": "pcs"},
+                        {"field": "unit_price", "element": row, "value": "12.50"},
                     ]}], "terms": []}
         return {"candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": json.dumps(response)}]}}]}
 
@@ -43,7 +44,7 @@ def test_gemini_reads_uploads_and_retries_without_permission(tmp_path, monkeypat
     output = BytesIO()
     canvas = Canvas(output)
     canvas.drawString(40, 790, "Quotation")
-    canvas.drawString(40, 740, "Quantity booked 50 | Anchor bolts | measure pcs")
+    canvas.drawString(40, 740, "Quantity booked 50 | Anchor bolts | measure pcs | each 12.50")
     canvas.showPage()
     canvas.save()
     with TestClient(create_app(tmp_path / "workspace.sqlite")) as client:

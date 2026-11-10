@@ -48,7 +48,7 @@ export type FindingDetail = {
 export type Issue = {
   id: string; rule: string; fingerprint: string; title: string; note: string;
   severity: "Blocking" | "Warning" | "Info"; evidence: EvidenceAnchor[]; detail?: FindingDetail;
-  search_hint?: string; source_editors?: SourceEditor[];
+  search_hint?: string; source_editors?: SourceEditor[]; subject?: unknown;
   review_required: boolean; confirmable: boolean; review: { status: ReviewStatus; note: string };
 };
 export type Comparison = {

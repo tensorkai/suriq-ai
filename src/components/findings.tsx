@@ -106,6 +106,7 @@ export function Findings({ batch, update, initial, editSource }: {
             {editors.length === 1 ? "Link source" : `Link source for ${document ? docName(document) : "quotation"}`}
           </button>;
         })}</div>}
+        {issue.rule === "match" && <MatchSuggestions batch={batch} issue={issue} update={update} />}
         <ReviewForm key={`${issue.id}:${issue.fingerprint}:${issue.review.status}:${issue.review.note}`}
           batch={batch.id} issue={issue} hasNext={Boolean(next)} update={(value, advance) => {
             update(value);
@@ -142,6 +143,34 @@ export function Findings({ batch, update, initial, editSource }: {
       {saved && <p role="status">Review saved.</p>}
     </Empty>}
 
+  </div>;
+}
+
+function MatchSuggestions({ batch, issue, update }: { batch: Batch; issue: Issue; update: (batch: Batch) => void }) {
+  const [pending, setPending] = useState("");
+  const [error, setError] = useState("");
+  const [quote, line] = Array.isArray(issue.subject) ? issue.subject as string[] : [];
+  const bom = batch.documents.find((doc) => doc.id === batch.baseline_document) ??
+    batch.documents.find((doc) => doc.role === "bom" || doc.role === "boq");
+  const rows = (batch.matches[`${quote}:${line}`]?.candidates ?? []).slice(0, 4)
+    .map((id) => bom?.lines.find((row) => row.id === id)).filter((row) => row !== undefined);
+  if (!rows.length) return null;
+  async function accept(id: string) {
+    setPending(id); setError("");
+    try {
+      update(await api<Batch>(`/documents/${quote}/line/${encodeURIComponent(line)}`, "PATCH",
+        { values: {}, anchors: {}, match: id, note: "Accepted suggested BOM match." }));
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "The match could not be saved.");
+    } finally { setPending(""); }
+  }
+  return <div className="match-suggestions">
+    <p className="fine-print">Suggested BOM rows. Accepting one links the line and reruns verification.</p>
+    {rows.map((row) => <PendingButton className="button secondary" type="button" key={row.id} pending={pending === row.id}
+      pendingLabel="Matching" disabled={Boolean(pending)} icon={<Check size={15} />} onClick={() => accept(row.id)}>
+      {[row.fields.code, row.fields.material || row.fields.description].filter(Boolean).join(" · ")}
+    </PendingButton>)}
+    {error && <p role="alert" className="fine-print">{error}</p>}
   </div>;
 }
 

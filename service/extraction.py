@@ -363,12 +363,24 @@ def add_term(snapshot, term):
         snapshot["term_anchors"][field] = anchor
 
 
+def name_from_specification(header):
+    """Treat a lone Specifications column as the item name, as many RFQ forms print it."""
+    fields = list(header.values())
+    if "specification" in fields and not {"material", "description"} & set(fields):
+        key = next(key for key, field in header.items() if field == "specification")
+        header = {**header, key: "description"}
+    return header
+
+
 def column_headers(words):
     columns = []
     index = 0
     while index < len(words):
         for length in range(min(4, len(words) - index), 0, -1):
             chunk = words[index:index + length]
+            # Join only touching words: "Material   Qty" across a column gap are two headers, not one.
+            if any(right[1][0] - left[1][0] - left[1][2] > .03 for left, right in zip(chunk, chunk[1:])):
+                continue
             field = LINE_ALIASES.get(label(" ".join(word[0] for word in chunk)))
             if field:
                 columns.append((chunk[0][1][0], field))
@@ -376,6 +388,8 @@ def column_headers(words):
                 break
         else:
             index += 1
+    renamed = name_from_specification(dict(enumerate(field for _, field in columns)))
+    columns = [(x, renamed[i]) for i, (x, _) in enumerate(columns)]
     names = {field for _, field in columns}
     if names & {"material", "description"} and names & {"quantity", "unit", "unit_price", "material_quantity"}:
         return columns
@@ -640,6 +654,16 @@ def pdf_rows(snapshot, source, rows, inherited, *, ocr=False):
     return columns
 
 
+def page_image(path, page):
+    """True when the page carries an embedded image large enough to be a scanned table."""
+    try:
+        listing = run_command(["pdfimages", "-list", "-f", str(page), "-l", str(page), str(path)]).decode("utf-8", "replace")
+    except ExtractionError:
+        return False
+    sizes = [line.split()[3:5] for line in listing.splitlines()[2:] if len(line.split()) > 4]
+    return any(w.isdigit() and h.isdigit() and int(w) * int(h) >= 300_000 for w, h in sizes)
+
+
 def command_version(executable, flag):
     try:
         result = subprocess.run([executable, flag], capture_output=True, timeout=3, check=False)
@@ -674,14 +698,21 @@ def extract_pdf(path, snapshot, directory, pdf_words):
             x1, y1, x2, y2 = (float(word.get(key)) for key in ("xMin", "yMin", "xMax", "yMax"))
             words.append((word.text.strip(), (x1/w, y1/h, (x2-x1)/w, (y2-y1)/h), 100))
         source = {"ref": page, "width": w, "height": h, "method": "text", "warning": ""}
-        if not words:
+        # A native title over a scanned table: the text layer has no table header but the page carries an image.
+        mixed = bool(words) and not any(column_headers(row) for row in row_groups(words)) and page_image(path, page)
+        if not words or mixed:
+            source["ocr_fallback"] = mixed
             source["method"] = "ocr"
             if "ocr" not in snapshot["provenance"]:
                 snapshot["provenance"]["ocr"] = command_version(os.getenv("SURIQ_TESSERACT", "tesseract"), "--version")
+            native = words
             try:
                 words = ocr_words(path, page, directory)
             except ExtractionError as exc:
                 source["warning"] = str(exc)
+            if mixed and not any(column_headers(row) for row in row_groups(words)):
+                # The image holds no readable table either: keep the exact native text.
+                words, source["method"], source["warning"] = native, "text", ""
         if not words and not source["warning"]:
             source["warning"] = "Unreadable page. Inspect the original before relying on this offer."
         elif any(word[2] < OCR_CONFIDENCE for word in words):
@@ -735,6 +766,8 @@ def extract_pdf(path, snapshot, directory, pdf_words):
                 line["fields"].get("code") and line["fields"].get("quantity") and line["fields"].get("unit")
                 for line in snapshot["lines"][start:]
             )
+            if source.get("ocr_fallback") and source["method"] == "ocr" and not snapshot["lines"][start:] and not source["warning"]:
+                source["warning"] = "This page has an image that may hold a table, but no rows were read. Check the original."
             source["cost_summary"] = bool(source.get("offer_issuer")) and any(
                 re.search(r"\b(?:project|works|work|replacement).*cost summary\b", " ".join(w[0] for w in row), re.I)
                 for row in pdf_words[page]
@@ -839,8 +872,8 @@ def extract_workbook(path, snapshot):
                                     headings[col] = combined
                         if row1 == row_no - 1 and row2 >= row_no and origin in prior:
                             headings.setdefault(origin, prior[origin])
-                header = {col: LINE_ALIASES[label(value)] for col, value in headings.items()
-                          if label(value) in LINE_ALIASES}
+                header = name_from_specification({col: LINE_ALIASES[label(value)] for col, value in headings.items()
+                                                  if label(value) in LINE_ALIASES})
                 prior = values
                 if set(header.values()) & {"material", "description"} and set(header.values()) & {
                     "quantity", "unit", "unit_price", "material_quantity"
@@ -900,8 +933,8 @@ def extract_docx(path, snapshot):
             if term:
                 add_term(snapshot, term)
                 continue
-            header = {col: LINE_ALIASES[label(value)] for col, value in values.items()
-                      if label(value) in LINE_ALIASES}
+            header = name_from_specification({col: LINE_ALIASES[label(value)] for col, value in values.items()
+                                              if label(value) in LINE_ALIASES})
             if set(header.values()) & {"material", "description"} and set(header.values()) & {"quantity", "unit", "material_quantity"}:
                 columns = header
                 continue

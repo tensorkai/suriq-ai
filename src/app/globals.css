@@ -358,3 +358,10 @@ svg { flex-shrink: 0; }
 .source-excerpt strong { margin-right: 4px; color: var(--green); text-decoration: underline; }
 .source-excerpt:hover { background: var(--mint); }
 .source-excerpt mark { background: #fff0bd; color: var(--ink); }
+
+.state-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 0 0 12px; }
+.state-legend div { display: flex; gap: 5px; align-items: center; }
+.state-legend dt { flex: none; font-size: 11px; font-weight: 600; }
+.state-legend dd { margin: 0; font-size: 11px; color: var(--muted); }
+.match-suggestions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 4px 0 12px; }
+.match-suggestions .fine-print { flex-basis: 100%; margin: 0; }

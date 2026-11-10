@@ -65,6 +65,10 @@ export function SupplierComparison({ batch, openFinding }: { batch: Batch; openF
         <input type="checkbox" checked={exceptions} onChange={(event) => setExceptions(event.target.checked)} /> Exceptions only
       </label>}
     </div>
+    {view === "Line items" && <dl className="state-legend" aria-label="What the labels mean">
+      {stateLegend.map(([state, meaning]) => <div key={state}><dt><Pill value={state} /></dt><dd>{meaning}</dd></div>)}
+      <div><dt>No label</dt><dd>matches</dd></div>
+    </dl>}
     {view === "Abstract of Bids" && batch.abstract ? <BidAbstract abstract={batch.abstract} batch={batch.id} /> :
     view === "Overview" || view === "Abstract of Bids" ? <div className="table-scroll summary-scroll" tabIndex={0} role="region" aria-label="Supplier Quotation Summary table">
       <table className="data-table matrix summary-matrix">
@@ -123,6 +127,11 @@ export function SupplierComparison({ batch, openFinding }: { batch: Batch; openF
     {sourceDoc && <SourcePreview document={sourceDoc} anchors={source} close={() => setSource([])} />}
   </section>;
 }
+
+const stateLegend: [string, string][] = [
+  ["mismatch", "differs from BOM"], ["needs review", "check source"], ["missing", "left out"],
+  ["not offered", "partial offer"], ["coverage unknown", "set coverage"],
+];
 
 const abstractTotals: [string, keyof AbstractOfBids["bidders"][number]][] = [
   ["Materials total (as calculated)", "materials"], ["Total amount of bid (as read)", "as_read"],
